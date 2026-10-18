@@ -1,0 +1,18 @@
+[package]
+name = "meisync-ysync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Yjs/Yrs sync protocol (YSync) over WebSocket for MeiSync"
+
+[dependencies]
+meisync-core.workspace = true
+meisync-api.workspace = true
+meisync-document.workspace = true
+meisync-persistence.workspace = true
+
+axum.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+yrs.workspace = true

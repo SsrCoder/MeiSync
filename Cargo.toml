@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/persistence",
+    "crates/document",
+    "crates/auth",
+    "crates/api",
+    "crates/webdav",
+    "crates/s3",
+    "crates/ysync",
+    "server",
+
+
+
+
+
+
+
+
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/meisync/meisync"
+
+[workspace.dependencies]
+meisync-core = { path = "crates/core" }
+meisync-persistence = { path = "crates/persistence" }
+meisync-document = { path = "crates/document" }
+meisync-auth = { path = "crates/auth" }
+meisync-api = { path = "crates/api" }
+meisync-ysync = { path = "crates/ysync" }
+meisync-webdav = { path = "crates/webdav" }
+meisync-s3 = { path = "crates/s3" }
+
+anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+http-body-util = "0.1"
+percent-encoding = "2"
+quick-xml = "0.38"
+rand = "0.9"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+yrs = { version = "0.28", features = ["sync"] }
+
+[profile.dev]
+debug = 1

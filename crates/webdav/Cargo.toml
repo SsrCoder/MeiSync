@@ -1,0 +1,20 @@
+[package]
+name = "meisync-webdav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebDAV frontend for MeiSync (full file view over the YDoc)"
+
+[dependencies]
+meisync-core.workspace = true
+meisync-api.workspace = true
+meisync-document.workspace = true
+meisync-persistence.workspace = true
+
+axum.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

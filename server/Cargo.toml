@@ -1,0 +1,44 @@
+[package]
+name = "meisync-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MeiSync server binary: WebDAV + S3 + YSync over one YDoc per file"
+
+[[bin]]
+name = "meisync"
+path = "src/main.rs"
+
+[lib]
+name = "meisync_server"
+path = "src/lib.rs"
+
+[dependencies]
+meisync-core.workspace = true
+meisync-persistence.workspace = true
+meisync-document.workspace = true
+meisync-auth.workspace = true
+meisync-api.workspace = true
+meisync-webdav.workspace = true
+meisync-s3.workspace = true
+meisync-ysync.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+tower = { workspace = true, features = ["util"] }
+tokio-tungstenite = "0.30"
+futures-util.workspace = true
+yrs.workspace = true

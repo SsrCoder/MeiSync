@@ -1,0 +1,21 @@
+[package]
+name = "meisync-persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite + local filesystem persistence for MeiSync"
+
+[dependencies]
+meisync-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+yrs.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

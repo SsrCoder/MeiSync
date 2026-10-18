@@ -1,0 +1,22 @@
+[package]
+name = "meisync-document"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DocumentManager: FileID -> YDoc, rooms, cache, lifecycle and persistence"
+
+[dependencies]
+meisync-core.workspace = true
+meisync-persistence.workspace = true
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+yrs.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+meisync-core = { path = "../core" }
+base64.workspace = true

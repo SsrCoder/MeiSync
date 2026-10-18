@@ -1,0 +1,37 @@
+{
+  "name": "meisync-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Tiptap + Yjs test client for a MeiSync node (YSync / WebDAV / S3)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "e2e": "tsx scripts/e2e.ts",
+    "explain": "tsx scripts/explain.ts"
+  },
+  "dependencies": {
+    "@tiptap/core": "^3.7.2",
+    "@tiptap/react": "^3.7.2",
+    "@tiptap/starter-kit": "^3.7.2",
+    "lib0": "^0.2.114",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "jsdom": "^30.1.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vitest": "^3.2.4"
+  }
+}
