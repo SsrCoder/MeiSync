@@ -37,7 +37,7 @@ use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use meisync_api::service::FileService;
-use meisync_api::AppState;
+use meisync_api::{AppState, ChangeKind, FileChange};
 use meisync_core::{FileMetadata, MeiSyncError, User};
 use meisync_document::{DocumentHandle, Room, RoomEvent};
 use std::sync::Arc;
@@ -269,7 +269,18 @@ async fn session(
         }
     });
 
-    let result = read_loop(&user, &handle, &room, conn, can_write, &mut stream, &reply_tx).await;
+    let result = read_loop(
+        &state,
+        &user,
+        &meta,
+        &handle,
+        &room,
+        conn,
+        can_write,
+        &mut stream,
+        &reply_tx,
+    )
+    .await;
 
     // Leaving the room also drops the awareness states this connection introduced (§10).
     state.documents.unsubscribe(&file_id, conn).await;
@@ -297,7 +308,9 @@ fn room_event_to_frame(event: RoomEvent) -> Option<Vec<u8>> {
 }
 
 async fn read_loop(
+    state: &Arc<AppState>,
     user: &User,
+    meta: &FileMetadata,
     handle: &DocumentHandle,
     room: &Arc<Room>,
     conn: meisync_document::ConnId,
@@ -342,8 +355,19 @@ async fn read_loop(
                         }
                         continue;
                     }
-                    if let Err(err) = handle.apply_update(&user.id, bytes, Some(conn)).await {
-                        tracing::warn!(error = %err, "failed to apply ysync update");
+                    // An empty diff is the normal answer of an already up-to-date client to our
+                    // own `SyncStep1`; it carries no content and must not count as a write.
+                    let non_empty = Update::decode_v1(&bytes)
+                        .map(|update| !update.is_empty())
+                        .unwrap_or(false);
+                    if !non_empty {
+                        continue;
+                    }
+                    match handle.apply_update(&user.id, bytes, Some(conn)).await {
+                        Ok(snapshot) => {
+                            announce_ysync_update(state, user, meta, &snapshot).await;
+                        }
+                        Err(err) => tracing::warn!(error = %err, "failed to apply ysync update"),
                     }
                 }
                 Message::Awareness(update) => {
@@ -375,6 +399,43 @@ async fn read_loop(
         }
     }
     Ok(())
+}
+
+/// Publish a file-level change for a CRDT edit.
+///
+/// The sync feed is what lets *closed* copies of a note (another Obsidian vault, a WebDAV/S3
+/// mirror, an admin view) notice an edit that only ever touched the YDoc. Without this, those
+/// clients had to wait for their next manifest poll because YSync writes bypass
+/// `FileService::replace_content` – the only other publisher on the hub.
+///
+/// The event is metadata only, exactly like the WebDAV/S3 ones: consumers re-read the manifest
+/// and fetch the materialised bytes themselves. Publishing per update is cheap (the client
+/// debounces rounds) and guarantees the last update of a burst is never lost to a timer.
+async fn announce_ysync_update(
+    state: &Arc<AppState>,
+    user: &User,
+    meta: &FileMetadata,
+    snapshot: &meisync_document::DocumentSnapshot,
+) {
+    let path = match state.files.path_of(&meta.id).await {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!(error = %err, "could not resolve the path of a ysync update");
+            return;
+        }
+    };
+    state.changes.publish(FileChange {
+        seq: 0,
+        kind: ChangeKind::Updated,
+        file_id: meta.id.0.clone(),
+        path,
+        old_path: None,
+        etag: Some(snapshot.etag.clone()),
+        size: snapshot.size,
+        collection: false,
+        updated_at: chrono::Utc::now(),
+        actor_id: user.id.0.clone(),
+    });
 }
 
 /// WebSocket endpoint rejection with a proper status code.

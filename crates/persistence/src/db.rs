@@ -88,12 +88,40 @@ impl SqliteDatabase {
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA).map_err(storage)?;
+        // Columns added after the MVP schema. `CREATE TABLE IF NOT EXISTS` never changes an
+        // existing table, so a node that was booted before this feature keeps its users table
+        // and only gets the new columns.
+        ensure_column(&conn, "users", "role", "TEXT NOT NULL DEFAULT 'user'")?;
+        ensure_column(&conn, "users", "disabled", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "users", "last_login_at", "INTEGER")?;
         Ok(())
     }
 }
 
 fn storage<E: std::fmt::Display>(err: E) -> MeiSyncError {
     MeiSyncError::Storage(err.to_string())
+}
+
+/// Add a column to an existing table when it is missing. SQLite has no `ADD COLUMN IF NOT
+/// EXISTS`, so the current shape is inspected first.
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage)?;
+    for name in rows {
+        if name.map_err(storage)? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 
 /// The MVP schema (`docs/mvp.md` §15).
@@ -106,7 +134,10 @@ CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     username      TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'user',
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    last_login_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -157,6 +188,33 @@ CREATE TABLE IF NOT EXISTS buckets (
     owner_id      TEXT,
     created_at    INTEGER NOT NULL
 );
+
+-- Administrative audit trail. Best effort: a write failure never fails the action itself.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         INTEGER NOT NULL,
+    actor_id   TEXT,
+    actor_name TEXT,
+    action     TEXT NOT NULL,
+    target     TEXT,
+    detail     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at DESC);
+
+-- Obsidian / sync clients. One row per (account, device, remote root).
+CREATE TABLE IF NOT EXISTS sync_devices (
+    user_id        TEXT NOT NULL,
+    device_id      TEXT NOT NULL,
+    vault          TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    platform       TEXT NOT NULL DEFAULT '',
+    plugin_version TEXT NOT NULL DEFAULT '',
+    last_seen_at   INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (user_id, device_id, vault)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_devices_user ON sync_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_devices_seen ON sync_devices(last_seen_at DESC);
 "#;
 
 /// Helper to build an owned `Arc<SqliteDatabase>` from a `&SqliteDatabase`.

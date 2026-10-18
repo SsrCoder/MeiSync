@@ -11,7 +11,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -84,6 +86,10 @@ impl AuthService {
         if !verify_password(password, &user.password_hash) {
             return Err(MeiSyncError::Unauthorized("invalid password".into()));
         }
+        if self.users.flags(&user.id).await?.disabled {
+            return Err(MeiSyncError::Unauthorized("account is disabled".into()));
+        }
+        self.users.touch_login(&user.id).await?;
         let (token, expires_at) = self.issue_token(&user.id).await?;
         Ok(AuthToken {
             token,
@@ -103,10 +109,37 @@ impl AuthService {
             let _ = self.sessions.delete(token).await;
             return Err(MeiSyncError::Unauthorized("token expired".into()));
         }
-        self.users
+        let user = self
+            .users
             .find_by_id(&session.user_id)
             .await?
-            .ok_or_else(|| MeiSyncError::Unauthorized("unknown user".into()))
+            .ok_or_else(|| MeiSyncError::Unauthorized("unknown user".into()))?;
+        if self.users.flags(&user.id).await?.disabled {
+            // Revoke immediately: a disabled account must not keep a working token.
+            let _ = self.sessions.delete(token).await;
+            return Err(MeiSyncError::Unauthorized("account is disabled".into()));
+        }
+        Ok(user)
+    }
+
+    pub async fn flags(&self, user_id: &UserId) -> Result<meisync_persistence::UserFlags> {
+        self.users.flags(user_id).await
+    }
+
+    pub async fn is_admin(&self, user_id: &UserId) -> Result<bool> {
+        self.users.is_admin(user_id).await
+    }
+
+    /// Administrative password reset. The caller is responsible for authorisation.
+    pub async fn set_password(&self, user_id: &UserId, password: &str) -> Result<()> {
+        if password.len() < 6 {
+            return Err(MeiSyncError::bad_request(
+                "password must be at least 6 characters",
+            ));
+        }
+        self.users
+            .set_password_hash(user_id, &hash_password(password)?)
+            .await
     }
 
     pub async fn logout(&self, token: &str) -> Result<()> {
@@ -126,7 +159,8 @@ impl AuthService {
     async fn issue_token(&self, user_id: &UserId) -> Result<(String, chrono::DateTime<Utc>)> {
         let token = generate_token();
         let now = Utc::now();
-        let expires_at = now + ChronoDuration::from_std(self.token_ttl).unwrap_or_else(|_| ChronoDuration::days(30));
+        let expires_at = now
+            + ChronoDuration::from_std(self.token_ttl).unwrap_or_else(|_| ChronoDuration::days(30));
         self.sessions
             .create(Session {
                 token: token.clone(),

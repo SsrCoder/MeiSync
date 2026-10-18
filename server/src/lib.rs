@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use meisync_api::AppState;
-use meisync_persistence::fs_store::CompactionPolicy;
 use meisync_document::DocumentManagerConfig;
+use meisync_persistence::fs_store::CompactionPolicy;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -27,6 +27,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/", get(root))
         .route("/health", get(|| async { "ok" }))
         .nest("/api", meisync_api::routes::router())
+        .nest("/api/admin", meisync_admin::router())
+        .merge(meisync_admin::ui_router())
         .merge(meisync_webdav::router())
         // The S3 API is reachable both at `/s3` and at the endpoint root, which is what
         // `--endpoint-url` based clients (`aws s3`, `rclone`, `mc`) expect.
@@ -45,10 +47,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
 }
 
 /// `GET /` – AWS signed requests are ListBuckets, everything else gets the service index.
-async fn root(
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-) -> Response {
+async fn root(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let (parts, body) = request.into_parts();
     if meisync_s3::is_sigv4(&parts) {
         let request = axum::http::Request::from_parts(parts, body);
@@ -67,13 +66,17 @@ async fn index() -> axum::Json<serde_json::Value> {
             "s3": "/s3",
             "ysync": "/ysync",
             "health": "/api/health",
+            "admin": "/admin",
+            "sync": "/api/sync",
         }
     }))
 }
 
 /// Boot a node: storage, namespace, document manager, auth and file service.
 pub async fn bootstrap(config: ServerConfig) -> anyhow::Result<std::sync::Arc<AppState>> {
-    AppState::bootstrap(config).await
+    let state = AppState::bootstrap(config).await?;
+    meisync_admin::bootstrap(&state).await?;
+    Ok(state)
 }
 
 /// Compose a configuration from CLI style values.
@@ -87,6 +90,9 @@ pub fn config_from_parts(
     token_ttl_days: u64,
     max_body_mb: usize,
     compaction: CompactionPolicy,
+    admin_user: Option<String>,
+    admin_password: Option<String>,
+    first_user_admin: bool,
 ) -> ServerConfig {
     ServerConfig {
         data_dir,
@@ -101,5 +107,8 @@ pub fn config_from_parts(
             compaction,
         },
         dav_at_root: false,
+        admin_user,
+        admin_password,
+        first_user_admin,
     }
 }

@@ -9,6 +9,7 @@ members = [
     "crates/webdav",
     "crates/s3",
     "crates/ysync",
+    "crates/admin",
     "server",
 
 
@@ -35,6 +36,7 @@ meisync-api = { path = "crates/api" }
 meisync-ysync = { path = "crates/ysync" }
 meisync-webdav = { path = "crates/webdav" }
 meisync-s3 = { path = "crates/s3" }
+meisync-admin = { path = "crates/admin" }
 
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }

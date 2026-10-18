@@ -846,6 +846,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "meisync-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "meisync-api",
+ "meisync-core",
+ "meisync-document",
+ "meisync-persistence",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "meisync-api"
 version = "0.1.0"
 dependencies = [
@@ -853,6 +874,8 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures-util",
+ "hex",
  "meisync-auth",
  "meisync-core",
  "meisync-document",
@@ -860,6 +883,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -956,6 +980,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "meisync-admin",
  "meisync-api",
  "meisync-auth",
  "meisync-core",
@@ -964,6 +989,7 @@ dependencies = [
  "meisync-s3",
  "meisync-webdav",
  "meisync-ysync",
+ "percent-encoding",
  "serde_json",
  "sha2",
  "tempfile",
@@ -996,6 +1022,7 @@ name = "meisync-ysync"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "futures-util",
  "meisync-api",
  "meisync-core",

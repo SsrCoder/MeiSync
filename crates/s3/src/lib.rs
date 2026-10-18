@@ -205,6 +205,12 @@ async fn authenticate(
         // The access key *is* a session token, which is also accepted.
         None => (state.auth.authenticate(&credentials.access_key).await?, true),
     };
+    // The username access-key path does not go through `AuthService::authenticate`, so the
+    // disabled flag has to be checked explicitly (an administrator may have disabled an account
+    // while an old session row was left behind by an external tool).
+    if state.auth.flags(&user.id).await?.disabled {
+        return Err(MeiSyncError::Unauthorized("account is disabled".into()));
+    }
 
     let request = sigv4::SigV4Request {
         method: parts.method.as_str(),

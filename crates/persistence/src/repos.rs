@@ -5,6 +5,7 @@ use meisync_core::{
     Session, SyncMode, User, UserId, Visibility,
 };
 use rusqlite::{params, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::db::SqliteDatabase;
@@ -56,14 +57,13 @@ impl UserRepository {
         let name = username.to_string();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        "SELECT id, username, password_hash, created_at FROM users WHERE username = ?1",
-                        params![name],
-                        row_to_user,
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    "SELECT id, username, password_hash, created_at FROM users WHERE username = ?1",
+                    params![name],
+                    row_to_user,
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -72,14 +72,13 @@ impl UserRepository {
         let id = id.0.clone();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        "SELECT id, username, password_hash, created_at FROM users WHERE id = ?1",
-                        params![id],
-                        row_to_user,
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    "SELECT id, username, password_hash, created_at FROM users WHERE id = ?1",
+                    params![id],
+                    row_to_user,
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -110,6 +109,132 @@ impl UserRepository {
                 Ok(())
             })
             .await
+    }
+
+    /// Administrative view of the account flags that are not part of the domain `User`.
+    pub async fn flags(&self, id: &UserId) -> Result<UserFlags> {
+        let id = id.0.clone();
+        self.db
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT role, disabled, last_login_at FROM users WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok(UserFlags {
+                            role: row.get(0)?,
+                            disabled: row.get::<_, i64>(1)? != 0,
+                            last_login_at: row.get::<_, Option<i64>>(2)?.map(from_ts),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage)
+                .map(|row| row.unwrap_or_default())
+            })
+            .await
+    }
+
+    pub async fn set_role(&self, id: &UserId, role: &str) -> Result<()> {
+        let id = id.0.clone();
+        let role = role.to_string();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET role = ?2 WHERE id = ?1",
+                    params![id, role],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn set_disabled(&self, id: &UserId, disabled: bool) -> Result<()> {
+        let id = id.0.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET disabled = ?2 WHERE id = ?1",
+                    params![id, if disabled { 1i64 } else { 0i64 }],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn set_password_hash(&self, id: &UserId, hash: &str) -> Result<()> {
+        let id = id.0.clone();
+        let hash = hash.to_string();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET password_hash = ?2 WHERE id = ?1",
+                    params![id, hash],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn touch_login(&self, id: &UserId) -> Result<()> {
+        let id = id.0.clone();
+        let now = ts(Utc::now());
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE users SET last_login_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn is_admin(&self, id: &UserId) -> Result<bool> {
+        Ok(self.flags(id).await?.role == "admin")
+    }
+
+    pub async fn count_admins(&self) -> Result<i64> {
+        self.db
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(storage)
+            })
+            .await
+    }
+
+    pub async fn count(&self) -> Result<i64> {
+        self.db
+            .call(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+                    .map_err(storage)
+            })
+            .await
+    }
+}
+
+/// Account fields used by authentication and the admin console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserFlags {
+    pub role: String,
+    pub disabled: bool,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+impl Default for UserFlags {
+    fn default() -> Self {
+        Self {
+            role: "user".to_string(),
+            disabled: false,
+            last_login_at: None,
+        }
     }
 }
 
@@ -153,21 +278,20 @@ impl SessionRepository {
         let token = token.to_string();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        "SELECT token, user_id, created_at, expires_at FROM sessions WHERE token = ?1",
-                        params![token],
-                        |row| {
-                            Ok(Session {
-                                token: row.get(0)?,
-                                user_id: UserId::new(row.get::<_, String>(1)?),
-                                created_at: from_ts(row.get::<_, i64>(2)?),
-                                expires_at: from_ts(row.get::<_, i64>(3)?),
-                            })
-                        },
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    "SELECT token, user_id, created_at, expires_at FROM sessions WHERE token = ?1",
+                    params![token],
+                    |row| {
+                        Ok(Session {
+                            token: row.get(0)?,
+                            user_id: UserId::new(row.get::<_, String>(1)?),
+                            created_at: from_ts(row.get::<_, i64>(2)?),
+                            expires_at: from_ts(row.get::<_, i64>(3)?),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -217,9 +341,47 @@ impl SessionRepository {
         let now = ts(Utc::now());
         self.db
             .call(move |conn| {
-                conn
-                    .execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])
+                conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])
                     .map_err(storage)
+            })
+            .await
+    }
+
+    pub async fn delete_for_user(&self, user_id: &UserId) -> Result<usize> {
+        let user_id = user_id.0.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+                    .map_err(storage)
+            })
+            .await
+    }
+
+    /// Every non expired session, newest first (admin console).
+    pub async fn list_active(&self, limit: usize) -> Result<Vec<Session>> {
+        let now = ts(Utc::now());
+        let limit = limit.clamp(1, 1000) as i64;
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT token, user_id, created_at, expires_at FROM sessions \
+                         WHERE expires_at > ?1 ORDER BY created_at DESC LIMIT ?2",
+                    )
+                    .map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![now, limit], |row| {
+                        Ok(Session {
+                            token: row.get(0)?,
+                            user_id: UserId::new(row.get::<_, String>(1)?),
+                            created_at: from_ts(row.get::<_, i64>(2)?),
+                            expires_at: from_ts(row.get::<_, i64>(3)?),
+                        })
+                    })
+                    .map_err(storage)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(storage)?;
+                Ok(rows)
             })
             .await
     }
@@ -282,14 +444,13 @@ impl FileRepository {
         let id = id.0.clone();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        &format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1"),
-                        params![id],
-                        row_to_file,
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    &format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1"),
+                    params![id],
+                    row_to_file,
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -299,14 +460,13 @@ impl FileRepository {
         let name = name.to_string();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        &format!("SELECT {FILE_COLUMNS} FROM files WHERE parent_id = ?1 AND name = ?2"),
-                        params![parent, name],
-                        row_to_file,
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    &format!("SELECT {FILE_COLUMNS} FROM files WHERE parent_id = ?1 AND name = ?2"),
+                    params![parent, name],
+                    row_to_file,
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -444,8 +604,7 @@ impl FileRepository {
     pub async fn count(&self) -> Result<i64> {
         self.db
             .call(|conn| {
-                conn
-                    .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
                     .map_err(storage)
             })
             .await
@@ -490,11 +649,7 @@ impl AclRepository {
 
 #[async_trait]
 impl AclProvider for AclRepository {
-    async fn acl_permissions(
-        &self,
-        file_id: &FileId,
-        user_id: &UserId,
-    ) -> Result<PermissionSet> {
+    async fn acl_permissions(&self, file_id: &FileId, user_id: &UserId) -> Result<PermissionSet> {
         let file_id = file_id.0.clone();
         let user_id = user_id.0.clone();
         self.db
@@ -598,23 +753,22 @@ impl YDocRepository {
         let file_id = file_id.0.clone();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        "SELECT file_id, snapshot_version, update_seq, updated_at, sync_mode \
+                conn.query_row(
+                    "SELECT file_id, snapshot_version, update_seq, updated_at, sync_mode \
                          FROM ydoc_states WHERE file_id = ?1",
-                        params![file_id],
-                        |row| {
-                            Ok(YDocRecord {
-                                file_id: FileId::new(row.get::<_, String>(0)?),
-                                snapshot_version: row.get::<_, i64>(1)?.max(0) as u64,
-                                update_seq: row.get::<_, i64>(2)?.max(0) as u64,
-                                updated_at: from_ts(row.get::<_, i64>(3)?),
-                                sync_mode: SyncMode::from_i64(row.get::<_, i64>(4)?),
-                            })
-                        },
-                    )
-                    .optional()
-                    .map_err(storage)
+                    params![file_id],
+                    |row| {
+                        Ok(YDocRecord {
+                            file_id: FileId::new(row.get::<_, String>(0)?),
+                            snapshot_version: row.get::<_, i64>(1)?.max(0) as u64,
+                            update_seq: row.get::<_, i64>(2)?.max(0) as u64,
+                            updated_at: from_ts(row.get::<_, i64>(3)?),
+                            sync_mode: SyncMode::from_i64(row.get::<_, i64>(4)?),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage)
             })
             .await
     }
@@ -671,8 +825,11 @@ impl YDocRepository {
         let file_id = file_id.0.clone();
         self.db
             .call(move |conn| {
-                conn.execute("DELETE FROM ydoc_states WHERE file_id = ?1", params![file_id])
-                    .map_err(storage)?;
+                conn.execute(
+                    "DELETE FROM ydoc_states WHERE file_id = ?1",
+                    params![file_id],
+                )
+                .map_err(storage)?;
                 Ok(())
             })
             .await
@@ -720,14 +877,27 @@ impl BucketRepository {
         let name = name.to_string();
         self.db
             .call(move |conn| {
-                conn
-                    .query_row(
-                        "SELECT collection_id FROM buckets WHERE name = ?1",
-                        params![name],
-                        |row| Ok(FileId::new(row.get::<_, String>(0)?)),
-                    )
-                    .optional()
-                    .map_err(storage)
+                conn.query_row(
+                    "SELECT collection_id FROM buckets WHERE name = ?1",
+                    params![name],
+                    |row| Ok(FileId::new(row.get::<_, String>(0)?)),
+                )
+                .optional()
+                .map_err(storage)
+            })
+            .await
+    }
+
+    pub async fn delete_for_collection(&self, collection_id: &FileId) -> Result<()> {
+        let collection_id = collection_id.0.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM buckets WHERE collection_id = ?1",
+                    params![collection_id],
+                )
+                .map_err(storage)?;
+                Ok(())
             })
             .await
     }
@@ -753,4 +923,205 @@ impl BucketRepository {
             })
             .await
     }
+}
+// ---------------------------------------------------------------------------------------------
+// Audit log (admin console + security relevant actions)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub at: DateTime<Utc>,
+    pub actor_id: Option<String>,
+    pub actor_name: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AuditRepository {
+    db: Arc<SqliteDatabase>,
+}
+
+impl AuditRepository {
+    pub fn new(db: Arc<SqliteDatabase>) -> Self {
+        Self { db }
+    }
+
+    pub async fn record(
+        &self,
+        actor_id: Option<String>,
+        actor_name: Option<String>,
+        action: &str,
+        target: Option<String>,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let action = action.to_string();
+        let now = ts(Utc::now());
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO audit_log (at, actor_id, actor_name, action, target, detail) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![now, actor_id, actor_name, action, target, detail],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list(&self, limit: usize) -> Result<Vec<AuditRecord>> {
+        let limit = limit.clamp(1, 1000) as i64;
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, at, actor_id, actor_name, action, target, detail \
+                         FROM audit_log ORDER BY id DESC LIMIT ?1",
+                    )
+                    .map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![limit], |row| {
+                        Ok(AuditRecord {
+                            id: row.get(0)?,
+                            at: from_ts(row.get::<_, i64>(1)?),
+                            actor_id: row.get(2)?,
+                            actor_name: row.get(3)?,
+                            action: row.get(4)?,
+                            target: row.get(5)?,
+                            detail: row.get(6)?,
+                        })
+                    })
+                    .map_err(storage)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(storage)?;
+                Ok(rows)
+            })
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sync devices (Obsidian plugin / desktop clients)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncDevice {
+    pub user_id: UserId,
+    pub device_id: String,
+    pub vault: String,
+    pub name: String,
+    pub platform: String,
+    pub plugin_version: String,
+    pub last_seen_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+pub struct SyncDeviceRepository {
+    db: Arc<SqliteDatabase>,
+}
+
+impl SyncDeviceRepository {
+    pub fn new(db: Arc<SqliteDatabase>) -> Self {
+        Self { db }
+    }
+
+    pub async fn upsert(&self, device: &SyncDevice) -> Result<()> {
+        let device = device.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO sync_devices \
+                        (user_id, device_id, vault, name, platform, plugin_version, last_seen_at, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(user_id, device_id, vault) DO UPDATE SET \
+                        name = ?4, platform = ?5, plugin_version = ?6, last_seen_at = ?7",
+                    params![
+                        device.user_id.0,
+                        device.device_id,
+                        device.vault,
+                        device.name,
+                        device.platform,
+                        device.plugin_version,
+                        ts(device.last_seen_at),
+                        ts(device.created_at),
+                    ],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn list_for_user(&self, user_id: &UserId) -> Result<Vec<SyncDevice>> {
+        let user_id = user_id.0.clone();
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT user_id, device_id, vault, name, platform, plugin_version, \
+                                last_seen_at, created_at \
+                         FROM sync_devices WHERE user_id = ?1 ORDER BY last_seen_at DESC",
+                    )
+                    .map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![user_id], row_to_sync_device)
+                    .map_err(storage)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(storage)?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    pub async fn list_all(&self, limit: usize) -> Result<Vec<SyncDevice>> {
+        let limit = limit.clamp(1, 1000) as i64;
+        self.db
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT user_id, device_id, vault, name, platform, plugin_version, \
+                                last_seen_at, created_at \
+                         FROM sync_devices ORDER BY last_seen_at DESC LIMIT ?1",
+                    )
+                    .map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![limit], row_to_sync_device)
+                    .map_err(storage)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(storage)?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    pub async fn delete_for_user(&self, user_id: &UserId) -> Result<()> {
+        let user_id = user_id.0.clone();
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM sync_devices WHERE user_id = ?1",
+                    params![user_id],
+                )
+                .map_err(storage)?;
+                Ok(())
+            })
+            .await
+    }
+}
+
+fn row_to_sync_device(row: &Row<'_>) -> rusqlite::Result<SyncDevice> {
+    Ok(SyncDevice {
+        user_id: UserId::new(row.get::<_, String>(0)?),
+        device_id: row.get(1)?,
+        vault: row.get(2)?,
+        name: row.get(3)?,
+        platform: row.get(4)?,
+        plugin_version: row.get(5)?,
+        last_seen_at: from_ts(row.get::<_, i64>(6)?),
+        created_at: from_ts(row.get::<_, i64>(7)?),
+    })
 }

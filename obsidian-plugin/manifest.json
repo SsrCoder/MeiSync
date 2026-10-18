@@ -1,0 +1,10 @@
+{
+  "id": "meisync-obsidian",
+  "name": "MeiSync",
+  "version": "0.2.1",
+  "minAppVersion": "1.5.0",
+  "description": "Hybrid Obsidian sync for a self-hosted MeiSync node: realtime Markdown via YSync, file-level notes/attachments/config sync.",
+  "author": "MeiSync",
+  "authorUrl": "https://github.com/meisync/meisync",
+  "isDesktopOnly": false
+}

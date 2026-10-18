@@ -564,3 +564,44 @@ async fn a_read_only_peer_cannot_write_a_public_document() {
     }
     assert!(written, "the owner must be able to write");
 }
+
+/// A CRDT edit must reach the file-level change feed.
+///
+/// Closed copies of a note (another Obsidian vault, a WebDAV/S3 mirror, the admin console) only
+/// learn about remote changes through `ChangeHub`. YSync writes bypass `FileService`, so without
+/// an explicit announcement those clients stayed stale until their next manifest poll.
+#[tokio::test]
+async fn ysync_edits_are_published_on_the_file_change_feed() {
+    let (server, state) = YSyncServer::spawn().await;
+    let token = register(&state, "alice").await;
+    put(&state, &token, "/private/alice/notes.md", "hello").await;
+
+    // Only events caused by the YSync edit matter here.
+    let mut changes = state.changes.subscribe();
+    while changes.try_recv().is_ok() {}
+
+    let mut a = connect(&server, &token, "/private/alice/notes.md").await;
+    let mut doc_a = Doc::new();
+    handshake(&mut a, &doc_a).await;
+
+    // The handshake's empty `SyncStep2` is not a write and must stay silent.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), changes.recv())
+            .await
+            .is_err(),
+        "an up-to-date client answering SyncStep1 must not announce a change"
+    );
+
+    let update = edit(&mut doc_a, 5, " world");
+    send(&mut a, Message::Sync(SyncMessage::Update(update))).await;
+
+    let change = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+        .await
+        .expect("a ysync edit must reach the change feed")
+        .expect("change");
+    assert_eq!(change.kind, meisync_api::ChangeKind::Updated);
+    assert_eq!(change.path, "/private/alice/notes.md");
+    assert!(!change.collection);
+    assert_eq!(change.size, 11);
+    assert!(change.etag.is_some(), "the event must carry the new ETag");
+}

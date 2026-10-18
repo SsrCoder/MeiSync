@@ -14,7 +14,8 @@ pub use fs_store::{
     UPDATES_DIR_NAME,
 };
 pub use repos::{
-    AclRepository, BucketRepository, FileRepository, SessionRepository, UserRepository, YDocRecord,
+    AclRepository, AuditRecord, AuditRepository, BucketRepository, FileRepository,
+    SessionRepository, SyncDevice, SyncDeviceRepository, UserFlags, UserRepository, YDocRecord,
     YDocRepository,
 };
 
@@ -50,7 +51,9 @@ impl Storage {
 impl Storage {
     /// Shared permission service boxed as a trait object, handy for axum state.
     pub fn permissions(&self) -> Arc<dyn PermissionService> {
-        Arc::new(VisibilityPermissionService::new(AclRepository::new(self.db.clone())))
+        Arc::new(VisibilityPermissionService::new(AclRepository::new(
+            self.db.clone(),
+        )))
     }
 }
 

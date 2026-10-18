@@ -1,0 +1,26 @@
+[package]
+name = "meisync-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Administration API and embedded console for MeiSync"
+
+[dependencies]
+meisync-core.workspace = true
+meisync-persistence.workspace = true
+meisync-document.workspace = true
+meisync-api.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tower = { workspace = true, features = ["util"] }

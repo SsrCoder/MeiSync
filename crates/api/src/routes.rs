@@ -10,6 +10,28 @@ use crate::extract::AuthUser;
 use crate::service::{Depth, FileService};
 use crate::state::AppState;
 
+async fn audit(
+    state: &AppState,
+    actor: Option<(&str, &str)>,
+    action: &str,
+    target: Option<String>,
+    detail: Option<String>,
+) {
+    let repo = meisync_persistence::AuditRepository::new(state.storage.db.clone());
+    if let Err(err) = repo
+        .record(
+            actor.map(|(id, _)| id.to_string()),
+            actor.map(|(_, name)| name.to_string()),
+            action,
+            target,
+            detail,
+        )
+        .await
+    {
+        tracing::warn!(error = %err, action, "failed to write audit log entry");
+    }
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
@@ -27,6 +49,7 @@ pub fn router() -> Router<AppState> {
         .route("/acl/{id}", get(get_acl).post(set_acl).delete(delete_acl))
         .route("/document", get(get_document_root))
         .route("/document/{*path}", get(get_document))
+        .nest("/sync", crate::sync::router())
 }
 
 /// The control plane: JSON view over the very same FileService the protocols use.
@@ -70,6 +93,27 @@ pub async fn register(
         }
         return Err(ApiError(err));
     }
+    // First-run convenience: a brand new node has no administrator, so the first account is
+    // promoted. Nodes that expose registration publicly should disable this with
+    // `--first-user-admin=false` and use MEISYNC_ADMIN_USER instead.
+    if state.config.first_user_admin
+        && state.auth.users().count_admins().await? == 0
+        && state.auth.users().count().await? == 1
+    {
+        if let Err(err) = state.auth.users().set_role(&token.user.id, "admin").await {
+            tracing::warn!(error = %err, "failed to promote the first account to admin");
+        } else {
+            tracing::info!(user = %token.user.username, "first account promoted to administrator");
+        }
+    }
+    audit(
+        &state,
+        Some((&token.user.id.0, &token.user.username)),
+        "auth.register",
+        Some(token.user.username.clone()),
+        None,
+    )
+    .await;
     Ok((axum::http::StatusCode::CREATED, Json(token)))
 }
 
@@ -85,6 +129,14 @@ pub async fn login(
         .files
         .ensure_user_namespace(&token.user.id, &token.user.username)
         .await?;
+    audit(
+        &state,
+        Some((&token.user.id.0, &token.user.username)),
+        "auth.login",
+        Some(token.user.username.clone()),
+        None,
+    )
+    .await;
     Ok(Json(token))
 }
 
@@ -266,7 +318,10 @@ pub async fn get_document(
     Ok(Json(document_json(&document, &canonical)?))
 }
 
-fn document_json(document: &meisync_core::FileDocument, path: &str) -> Result<serde_json::Value, ApiError> {
+fn document_json(
+    document: &meisync_core::FileDocument,
+    path: &str,
+) -> Result<serde_json::Value, ApiError> {
     Ok(serde_json::json!({
         "id": document.id.0,
         "path": path,
@@ -329,7 +384,10 @@ pub async fn set_acl(
                 ))))
             }
         };
-        state.files.set_visibility(&user, &file_id, visibility).await?;
+        state
+            .files
+            .set_visibility(&user, &file_id, visibility)
+            .await?;
     }
     if let Some(target) = request.user_id.or(request.username) {
         let target_id = match state.auth.users().find_by_username(&target).await? {
@@ -338,7 +396,12 @@ pub async fn set_acl(
         };
         state
             .files
-            .acl_grant(&user, &file_id, &target_id, PermissionSet::from_list(&request.permissions))
+            .acl_grant(
+                &user,
+                &file_id,
+                &target_id,
+                PermissionSet::from_list(&request.permissions),
+            )
             .await?;
     }
     Ok(axum::http::StatusCode::NO_CONTENT)

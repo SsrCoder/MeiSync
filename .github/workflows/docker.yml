@@ -1,0 +1,104 @@
+name: Docker image
+
+# Builds the MeiSync server image and pushes it to Docker Hub.
+#
+# Required repository secrets:
+#   DOCKERHUB_USERNAME  Docker Hub account that owns the image
+#   DOCKERHUB_TOKEN     Docker Hub access token (read/write)
+#
+# Optional repository variable:
+#   DOCKER_IMAGE        full image name, defaults to <DOCKERHUB_USERNAME>/meisync
+#
+# Tag conventions:
+#   v*          -> image tags: latest (default branch), 1.2.3, 1.2, v1.2.3, sha-<short>
+#   server-v*   -> image tags: 1.2.3, v1.2.3, sha-<short>
+#   other       -> default branch pushes only publish `latest` and `sha-<short>`
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*', 'server-v*']
+    paths-ignore:
+      - 'docs/**'
+      - 'obsidian-plugin/**'
+      - 'web/**'
+      - '**/*.md'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'server/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE: ${{ vars.DOCKER_IMAGE || format('{0}/meisync', secrets.DOCKERHUB_USERNAME || 'meisync') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Uncomment to also publish linux/arm64 (needs QEMU and roughly doubles build time):
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=^server-v(.*)$,group=1
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          # Load the single-platform image so the smoke test below can run it.
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        env:
+          # `version` is a bare tag (`latest`, `1.2.3`, `pr-12`); the repository-qualified ref is
+          # what `docker run` has to resolve, because a bare tag means `docker.io/library/<tag>`.
+          IMAGE: ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name meisync-smoke -p 18080:8080 "$IMAGE"
+          curl -fsS --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:18080/api/health
+          docker stop meisync-smoke

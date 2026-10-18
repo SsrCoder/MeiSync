@@ -52,6 +52,18 @@ struct Cli {
     /// Also serve WebDAV from `/` (so a whole server root can be mounted directly).
     #[arg(long, default_value_t = false)]
     dav_at_root: bool,
+
+    /// Account that is always promoted to administrator at startup.
+    #[arg(long, env = "MEISYNC_ADMIN_USER")]
+    admin_user: Option<String>,
+
+    /// Password used only when the configured admin account does not exist yet.
+    #[arg(long, env = "MEISYNC_ADMIN_PASSWORD")]
+    admin_password: Option<String>,
+
+    /// Promote the first registered account when the node has no administrator yet.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    first_user_admin: bool,
 }
 
 #[tokio::main]
@@ -78,6 +90,9 @@ async fn main() -> anyhow::Result<()> {
             max_update_bytes: cli.compact_after_bytes,
             snapshot_bytes: cli.compact_snapshot_bytes,
         },
+        cli.admin_user.clone(),
+        cli.admin_password.clone(),
+        cli.first_user_admin,
     );
     let mut config = config;
     config.dav_at_root = cli.dav_at_root;
@@ -96,8 +111,10 @@ async fn main() -> anyhow::Result<()> {
         "MeiSync listening"
     );
     println!(
-        "MeiSync is running\n  data:   {}\n  bind:   http://{}\n  WebDAV: http://{}/dav\n  S3:     http://{}/s3\n  YSync:  ws://{}/ysync/<path>\n  API:    http://{}/api/health",
+        "MeiSync is running\n  data:   {}\n  bind:   http://{}\n  admin:  http://{}/admin\n  WebDAV: http://{}/dav\n  S3:     http://{}/s3\n  YSync:  ws://{}/ysync/<path>\n  sync:   http://{}/api/sync\n  API:    http://{}/api/health",
         config.data_dir.display(),
+        config.bind,
+        config.bind,
         config.bind,
         config.bind,
         config.bind,

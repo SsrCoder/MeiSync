@@ -4,11 +4,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use meisync_core::{
     guess_sync_mode, resolve_content_type, AclEntry, AclProvider, FileDocument, FileId, FileKind,
-    FileMetadata, MeiSyncError,
-    PermissionSet, PermissionService, Preconditions, Result, User, Visibility, PUBLIC_ROOT, PRIVATE_ROOT,
+    FileMetadata, MeiSyncError, PermissionService, PermissionSet, Preconditions, Result, User,
+    Visibility, PRIVATE_ROOT, PUBLIC_ROOT,
 };
 use meisync_document::{DocumentHandle, DocumentManager, DocumentSnapshot};
 use meisync_persistence::{AclRepository, BucketRepository, FileRepository};
+
+use crate::events::{ChangeHub, ChangeKind, FileChange};
 
 /// The virtual root of the namespace (`/`). It is a real row so that every other row has a
 /// parent, which is what makes `UNIQUE(parent_id, name)` work.
@@ -97,7 +99,21 @@ pub trait FileService: Send + Sync {
 
     async fn list(&self, actor: &User, path: &str, depth: Depth) -> Result<Vec<FileMetadata>>;
 
-    async fn delete(&self, actor: &User, path: &str) -> Result<()>;
+    /// Delete a path without any conditional header.
+    async fn delete(&self, actor: &User, path: &str) -> Result<()> {
+        self.delete_checked(actor, path, Preconditions::default())
+            .await
+    }
+
+    /// Same as [`FileService::delete`], but the `If-Match` / `If-None-Match` preconditions are
+    /// evaluated against the live document right before it is closed (§25). The preconditions
+    /// apply to the target path only; a recursive child deletion stays unconditional.
+    async fn delete_checked(
+        &self,
+        actor: &User,
+        path: &str,
+        preconditions: Preconditions,
+    ) -> Result<()>;
 
     async fn move_file(
         &self,
@@ -145,8 +161,11 @@ pub trait FileService: Send + Sync {
     ) -> Result<DocumentSnapshot>;
 
     /// Open the document behind a path (YSync room join).
-    async fn open_document(&self, actor: &User, path: &str)
-        -> Result<(FileMetadata, DocumentHandle)>;
+    async fn open_document(
+        &self,
+        actor: &User,
+        path: &str,
+    ) -> Result<(FileMetadata, DocumentHandle)>;
 
     /// Absolute namespace path of a document, e.g. `/private/alice/todo.md`.
     async fn path_of(&self, id: &FileId) -> Result<String>;
@@ -165,11 +184,7 @@ pub trait FileService: Send + Sync {
     ) -> Result<()>;
 
     /// Recursive listing used by S3 `ListObjectsV2`.
-    async fn list_recursive(
-        &self,
-        actor: &User,
-        spec: &RecursiveListSpec<'_>,
-    ) -> Result<Listing>;
+    async fn list_recursive(&self, actor: &User, spec: &RecursiveListSpec<'_>) -> Result<Listing>;
 
     async fn bucket_collection(&self, bucket: &str) -> Result<FileMetadata>;
 
@@ -185,13 +200,11 @@ pub trait FileService: Send + Sync {
 }
 
 /// Configuration that influences permission defaults.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FileServiceConfig {
     /// When enabled, every authenticated user may write public files (see `docs/mvp.md` §12).
     pub public_default_write: bool,
 }
-
 
 pub struct DefaultFileService {
     files: Arc<FileRepository>,
@@ -200,6 +213,7 @@ pub struct DefaultFileService {
     documents: Arc<DocumentManager>,
     permissions: Arc<dyn PermissionService>,
     config: FileServiceConfig,
+    changes: Arc<ChangeHub>,
 }
 
 impl DefaultFileService {
@@ -210,6 +224,7 @@ impl DefaultFileService {
         documents: Arc<DocumentManager>,
         permissions: Arc<dyn PermissionService>,
         config: FileServiceConfig,
+        changes: Arc<ChangeHub>,
     ) -> Arc<Self> {
         Arc::new(Self {
             files,
@@ -218,7 +233,34 @@ impl DefaultFileService {
             documents,
             permissions,
             config,
+            changes,
         })
+    }
+
+    pub fn changes(&self) -> &Arc<ChangeHub> {
+        &self.changes
+    }
+
+    fn announce(
+        &self,
+        actor_id: &str,
+        kind: ChangeKind,
+        meta: &FileMetadata,
+        path: String,
+        old_path: Option<String>,
+    ) {
+        self.changes.publish(FileChange {
+            seq: 0,
+            kind,
+            file_id: meta.id.0.clone(),
+            path,
+            old_path,
+            etag: meta.etag.clone(),
+            size: meta.size,
+            collection: meta.is_collection(),
+            updated_at: meta.updated_at,
+            actor_id: actor_id.to_string(),
+        });
     }
 
     // -----------------------------------------------------------------------------------------
@@ -322,7 +364,10 @@ impl DefaultFileService {
                     self.files
                         .set_visibility(&existing.id, Visibility::Private)
                         .await?;
-                    self.files.find_by_id(&existing.id).await?.unwrap_or(existing)
+                    self.files
+                        .find_by_id(&existing.id)
+                        .await?
+                        .unwrap_or(existing)
                 } else {
                     existing
                 }
@@ -332,7 +377,9 @@ impl DefaultFileService {
                     .await?
             }
         };
-        self.buckets.upsert(username, &home.id, Some(user_id)).await?;
+        self.buckets
+            .upsert(username, &home.id, Some(user_id))
+            .await?;
         Ok(home)
     }
 
@@ -373,6 +420,12 @@ impl DefaultFileService {
     /// listing). Checking intermediate nodes would hide `/private/<other user>` while still
     /// allowing `/private/<own user>`, so the visibility of a *leaf* is what decides.
     pub async fn resolve(&self, _actor: &User, path: &str) -> Result<FileMetadata> {
+        self.resolve_path(path).await
+    }
+
+    /// Path resolution without a permission check. Callers that are not protocol frontends
+    /// (the admin console, sync root provisioning) must enforce their own authorisation.
+    pub async fn resolve_path(&self, path: &str) -> Result<FileMetadata> {
         let segments = Self::split_path(path);
         let mut current = self
             .files
@@ -390,6 +443,89 @@ impl DefaultFileService {
             };
         }
         Ok(current)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Admin helpers
+    // -----------------------------------------------------------------------------------------
+
+    /// Node plus descendants, without filtering by permission. Used by the admin file browser.
+    pub async fn admin_list(&self, path: &str, depth: Depth) -> Result<Vec<FileMetadata>> {
+        let meta = self.resolve_path(path).await?;
+        let mut out = vec![meta.clone()];
+        if depth == Depth::Zero {
+            return Ok(out);
+        }
+        let mut queue = vec![meta];
+        while let Some(current) = queue.pop() {
+            for child in self.files.list_children(&current.id).await? {
+                if child.is_collection() && depth == Depth::Infinite {
+                    queue.push(child.clone());
+                }
+                out.push(child);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn admin_read_content(&self, path: &str) -> Result<(FileMetadata, DocumentSnapshot)> {
+        let meta = self.resolve_path(path).await?;
+        if meta.is_collection() {
+            return Err(MeiSyncError::Conflict("path is a collection".into()));
+        }
+        let handle = self.documents.open(&meta).await?;
+        let snapshot = handle.read().await;
+        Ok((meta, snapshot))
+    }
+
+    /// Recursively delete a namespace entry, bypassing the owner check. Every YDoc is closed
+    /// before the rows disappear, so the on-disk directories are removed through the normal
+    /// lifecycle instead of being leaked.
+    pub async fn admin_delete_path(&self, path: &str) -> Result<()> {
+        let normalized = Self::normalize_path(path);
+        if normalized == "/" || normalized == "/private" || normalized == "/public" {
+            return Err(MeiSyncError::Forbidden(
+                "the root, /private and /public containers cannot be deleted".into(),
+            ));
+        }
+        let meta = self.resolve_path(path).await?;
+        if meta.id.as_str() == ROOT_ID {
+            return Err(MeiSyncError::Forbidden("cannot delete the root".into()));
+        }
+        let mut entries: Vec<(FileMetadata, String)> = Vec::new();
+        for descendant in self.files.list_descendants(&meta.id).await? {
+            let descendant_path = self.path_of(&descendant.id).await?;
+            entries.push((descendant, descendant_path));
+        }
+        let meta_path = self.path_of(&meta.id).await?;
+        entries.push((meta.clone(), meta_path));
+
+        for (entry, _) in &entries {
+            self.documents.close(&entry.id).await?;
+        }
+        self.files.delete(&meta.id).await?;
+        for (entry, entry_path) in entries {
+            if entry.is_collection() {
+                self.buckets.delete_for_collection(&entry.id).await?;
+            }
+            self.announce("admin", ChangeKind::Deleted, &entry, entry_path, None);
+        }
+        Ok(())
+    }
+
+    /// Purge `/private/<username>` when an administrator removes an account.
+    pub async fn admin_delete_namespace(&self, username: &str) -> Result<()> {
+        let path = format!("/{PRIVATE_ROOT}/{username}");
+        match self.admin_delete_path(&path).await {
+            Ok(()) => Ok(()),
+            Err(MeiSyncError::NotFound(_)) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Provision a collection path (including every missing parent). Used by sync roots.
+    pub async fn ensure_collection_path(&self, actor: &User, path: &str) -> Result<FileMetadata> {
+        self.ensure_parent_chain(actor, path).await
     }
 
     /// Split a *child* path into `(parent_path, name)`.
@@ -442,7 +578,11 @@ impl DefaultFileService {
     /// WebDAV clients and S3 keys both expect `PUT a/b/c.txt` to work even when `a/b` does not
     /// exist yet (S3 has no directories at all). Missing collections inherit the visibility of
     /// their closest existing ancestor and are owned by the caller.
-    pub async fn ensure_parent_chain(&self, actor: &User, parent_path: &str) -> Result<FileMetadata> {
+    pub async fn ensure_parent_chain(
+        &self,
+        actor: &User,
+        parent_path: &str,
+    ) -> Result<FileMetadata> {
         let mut current = self
             .files
             .find_by_id(&root_id())
@@ -470,11 +610,7 @@ impl DefaultFileService {
                     .has(PermissionSet::WRITE);
             if !allowed {
                 let path = current_path.clone();
-                if self
-                    .permissions
-                    .can_read_metadata(actor, &current)
-                    .await?
-                {
+                if self.permissions.can_read_metadata(actor, &current).await? {
                     return Err(MeiSyncError::Forbidden(format!("cannot create {path}")));
                 }
                 return Err(MeiSyncError::NotFound(path));
@@ -547,8 +683,8 @@ impl DefaultFileService {
             let perms = self.effective_permissions(actor, parent).await?;
             // The system owned `/public` collection is the shared drop box: every authenticated
             // user may publish there (§12).
-            let shared_dropbox = parent.visibility == Visibility::Public
-                && parent.owner_id.as_str() == SYSTEM_OWNER;
+            let shared_dropbox =
+                parent.visibility == Visibility::Public && parent.owner_id.as_str() == SYSTEM_OWNER;
             if !perms.has(PermissionSet::WRITE) && !shared_dropbox {
                 // A collection the caller cannot even read must not be revealed as "exists but
                 // forbidden" (README: private files of other users answer 404, never 403).
@@ -627,7 +763,10 @@ impl DefaultFileService {
                 }
             }
         }
-        Ok(self.files.find_by_id(&id).await?.unwrap_or(meta))
+        let refreshed = self.files.find_by_id(&id).await?.unwrap_or(meta);
+        let path = self.path_of(&id).await?;
+        self.announce(&actor.id.0, ChangeKind::Created, &refreshed, path, None);
+        Ok(refreshed)
     }
 
     async fn require_read(&self, actor: &User, meta: &FileMetadata) -> Result<()> {
@@ -637,7 +776,9 @@ impl DefaultFileService {
         if self.permissions.can_read_metadata(actor, meta).await? {
             Ok(())
         } else {
-            Err(MeiSyncError::NotFound(self.path_of(&meta.id).await.unwrap_or_default()))
+            Err(MeiSyncError::NotFound(
+                self.path_of(&meta.id).await.unwrap_or_default(),
+            ))
         }
     }
 
@@ -652,7 +793,9 @@ impl DefaultFileService {
         if !perms.has(PermissionSet::READ) {
             return Err(MeiSyncError::NotFound(path));
         }
-        Err(MeiSyncError::Forbidden(format!("write access denied: {path}")))
+        Err(MeiSyncError::Forbidden(format!(
+            "write access denied: {path}"
+        )))
     }
 
     async fn require_sync(&self, actor: &User, meta: &FileMetadata) -> Result<()> {
@@ -679,7 +822,9 @@ impl DefaultFileService {
         if !perms.has(PermissionSet::READ) {
             return Err(MeiSyncError::NotFound(path));
         }
-        Err(MeiSyncError::Forbidden(format!("delete access denied: {path}")))
+        Err(MeiSyncError::Forbidden(format!(
+            "delete access denied: {path}"
+        )))
     }
 
     /// Effective permission set, honouring the `public_default_write` server option.
@@ -702,7 +847,9 @@ impl DefaultFileService {
 #[async_trait]
 impl FileService for DefaultFileService {
     async fn create(&self, actor: &User, spec: CreateFileSpec) -> Result<FileMetadata> {
-        let parent = self.resolve_existing_parent(actor, &spec.parent_path).await?;
+        let parent = self
+            .resolve_existing_parent(actor, &spec.parent_path)
+            .await?;
         self.create_in_parent(actor, &parent, spec).await
     }
 
@@ -741,14 +888,31 @@ impl FileService for DefaultFileService {
         Ok(out)
     }
 
-    async fn delete(&self, actor: &User, path: &str) -> Result<()> {
+    async fn delete_checked(
+        &self,
+        actor: &User,
+        path: &str,
+        preconditions: Preconditions,
+    ) -> Result<()> {
         let meta = self.resolve(actor, path).await?;
         if meta.id.as_str() == ROOT_ID {
             return Err(MeiSyncError::Forbidden("cannot delete the root".into()));
         }
         self.require_delete(actor, &meta).await?;
+        let deleted_path = self
+            .path_of(&meta.id)
+            .await
+            .unwrap_or_else(|_| meta.name.clone());
 
-        // Delete children first: close their rooms and drop their YDoc artefacts (§28).
+        // A collection carries no document ETag, so its preconditions are settled before anything
+        // below it is touched: a rejected DELETE must not leave a half-deleted tree behind.
+        if meta.is_collection() {
+            preconditions.check_write(None)?;
+        }
+
+        // Delete children first: close their rooms and drop their YDoc artefacts (§28). The
+        // conditional headers of the request belong to the target path, so the recursion keeps
+        // the unconditional semantics of [`FileService::delete`].
         let children = self.files.list_children(&meta.id).await?;
         for child in children {
             let child_path = self.child_name_of(&child).await?;
@@ -759,8 +923,21 @@ impl FileService for DefaultFileService {
         for descendant in &descendants {
             self.documents.close(&descendant.id).await?;
         }
+        // §25: `If-Match` / `If-None-Match` are evaluated against the live document, immediately
+        // before it is closed. Reading the ETag from a metadata row first would let a YSync update
+        // or a WebDAV PUT land in the window between the check and the delete and be destroyed,
+        // even though the client sent the ETag it had observed.
+        //
+        // An unconditional DELETE carries no conditional headers, so there is nothing to evaluate:
+        // it must not pay for a document load, and it must not start failing on a persisted state
+        // the caller never asked to read.
+        if !meta.is_collection() && !preconditions.is_empty() {
+            let etag = self.documents.open(&meta).await?.etag().await;
+            preconditions.check_write(Some(&etag))?;
+        }
         self.documents.close(&meta.id).await?;
         self.files.delete(&meta.id).await?;
+        self.announce(&actor.id.0, ChangeKind::Deleted, &meta, deleted_path, None);
         Ok(())
     }
 
@@ -777,6 +954,10 @@ impl FileService for DefaultFileService {
             return Err(MeiSyncError::Forbidden("cannot move the root".into()));
         }
         self.require_write(actor, &meta).await?;
+        let old_path = self
+            .path_of(&meta.id)
+            .await
+            .unwrap_or_else(|_| from.to_string());
 
         let dest_parent = self.resolve(actor, to_parent).await?;
         // `/private/<name>` is provisioned by the server at registration and must not be
@@ -830,7 +1011,8 @@ impl FileService for DefaultFileService {
                             "{name} already exists"
                         )));
                     }
-                    self.delete(actor, &Self::join_path(to_parent, &name)).await?;
+                    self.delete(actor, &Self::join_path(to_parent, &name))
+                        .await?;
                 }
             }
         } else {
@@ -841,7 +1023,8 @@ impl FileService for DefaultFileService {
                             "{name} already exists"
                         )));
                     }
-                    self.delete(actor, &Self::join_path(to_parent, &name)).await?;
+                    self.delete(actor, &Self::join_path(to_parent, &name))
+                        .await?;
                 }
             }
             meta.parent_id = Some(dest_parent.id.clone());
@@ -852,8 +1035,12 @@ impl FileService for DefaultFileService {
         self.files.update_meta(&meta).await?;
 
         let new_path = self.path_of(&meta.id).await?;
-        self.documents.notify_moved(&meta.id, new_path.clone()).await;
-        Ok(self.files.find_by_id(&meta.id).await?.unwrap_or(meta))
+        self.documents
+            .notify_moved(&meta.id, new_path.clone())
+            .await;
+        let refreshed = self.files.find_by_id(&meta.id).await?.unwrap_or(meta);
+        self.announce(&actor.id.0, ChangeKind::Moved, &refreshed, new_path, Some(old_path));
+        Ok(refreshed)
     }
 
     async fn read_content(&self, actor: &User, path: &str) -> Result<DocumentSnapshot> {
@@ -924,7 +1111,9 @@ impl FileService for DefaultFileService {
         // A file the caller may not even see must not be reported as "exists but forbidden".
         self.require_read(actor, &meta).await?;
         if meta.is_collection() {
-            return Err(MeiSyncError::Conflict("cannot write to a collection".into()));
+            return Err(MeiSyncError::Conflict(
+                "cannot write to a collection".into(),
+            ));
         }
         let perms = self.effective_permissions(actor, &meta).await?;
         if !perms.has(PermissionSet::WRITE) {
@@ -933,14 +1122,22 @@ impl FileService for DefaultFileService {
             )));
         }
         let handle = self.documents.open(&meta).await?;
-        if existed {
-            return handle
+        let snapshot = if existed {
+            handle
                 .replace_content_checked(&actor.id, body, content_type.clone(), &preconditions)
-                .await;
-        }
-        handle
-            .replace_content(&actor.id, body, content_type.clone())
+                .await?
+        } else {
+            handle
+                .replace_content(&actor.id, body, content_type.clone())
+                .await?
+        };
+        let refreshed = self.files.find_by_id(&meta.id).await?.unwrap_or(meta);
+        let path = self
+            .path_of(&refreshed.id)
             .await
+            .unwrap_or_else(|_| path.to_string());
+        self.announce(&actor.id.0, ChangeKind::Updated, &refreshed, path, None);
+        Ok(snapshot)
     }
 
     async fn apply_update(
@@ -963,7 +1160,11 @@ impl FileService for DefaultFileService {
         }
         self.require_sync(actor, &meta).await?;
         let handle = self.documents.open(&meta).await?;
-        handle.apply_update(&actor.id, update, except).await
+        let snapshot = handle.apply_update(&actor.id, update, except).await?;
+        let refreshed = self.files.find_by_id(&meta.id).await?.unwrap_or(meta);
+        let path = self.path_of(&refreshed.id).await.unwrap_or_default();
+        self.announce(&actor.id.0, ChangeKind::Updated, &refreshed, path, None);
+        Ok(snapshot)
     }
 
     async fn open_document(
@@ -1033,14 +1234,21 @@ impl FileService for DefaultFileService {
                 "only the owner may change visibility".into(),
             ));
         }
-        self.files.set_visibility(id, visibility).await
+        self.files.set_visibility(id, visibility).await?;
+        if let Some(refreshed) = self.files.find_by_id(id).await? {
+            let path = self.path_of(id).await.unwrap_or_default();
+            self.announce(&actor.id.0, ChangeKind::Updated, &refreshed, path, None);
+        }
+        Ok(())
     }
 
     async fn acl_list(&self, actor: &User, id: &FileId) -> Result<Vec<AclEntry>> {
         let meta = self.get_by_id(actor, id).await?;
         let perms = self.effective_permissions(actor, &meta).await?;
         if !perms.has(PermissionSet::DELETE) {
-            return Err(MeiSyncError::Forbidden("only the owner may read the ACL".into()));
+            return Err(MeiSyncError::Forbidden(
+                "only the owner may read the ACL".into(),
+            ));
         }
         self.acl.acl_list(id).await
     }
@@ -1071,11 +1279,7 @@ impl FileService for DefaultFileService {
         self.acl.acl_set(id, user, permissions).await
     }
 
-    async fn list_recursive(
-        &self,
-        actor: &User,
-        spec: &RecursiveListSpec<'_>,
-    ) -> Result<Listing> {
+    async fn list_recursive(&self, actor: &User, spec: &RecursiveListSpec<'_>) -> Result<Listing> {
         let base_path = spec.base_path;
         let prefix = spec.prefix;
         let max_keys = spec.max_keys;

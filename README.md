@@ -63,6 +63,24 @@ ws://127.0.0.1:8080/ysync/private/alice/notes/todo.md?token=$TOKEN
 `meisync --help` lists every option (`--public-default-write`, `--max-cache-documents`,
 `--idle-unload-secs`, `--compact-after-updates`, `--compact-after-bytes`, `--dav-at-root`, …).
 
+### Docker
+
+```bash
+docker build -t meisync .
+docker run -d --name meisync -p 8080:8080 -v meisync-data:/data meisync
+```
+
+The image runs as the unprivileged user `meisync` (uid 10001) and keeps the SQLite database and
+YDoc snapshots under the `/data` volume. Everything is configured through CLI flags or
+`MEISYNC_*` environment variables (`MEISYNC_DATA_DIR`, `MEISYNC_BIND`, `MEISYNC_ADMIN_USER`,
+`MEISYNC_ADMIN_PASSWORD`); appended arguments override the defaults, e.g.
+`docker run … meisync --public-default-write`.
+
+`.github/workflows/docker.yml` builds the image and pushes `$DOCKERHUB_USERNAME/meisync` (override
+with the `DOCKER_IMAGE` repository variable). It needs the `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` repository secrets; `v*` / `server-v*` tags additionally publish semver tags,
+and pull requests only build without pushing.
+
 ### Test client (Tiptap + Yjs)
 
 ```bash
@@ -86,10 +104,12 @@ crates/
   persistence/  SQLite repositories + LocalDocumentStore (DocumentStore trait, §32)
   document/     DocumentManager: FileID→YDoc, cache, rooms, lifecycle, persistence (§21–§24)
   auth/         Argon2 password hashing, session tokens (§11)
-  api/          FileService (§33), AppState, /api control plane
+  api/          FileService (§33), AppState, /api control plane + Obsidian sync API
+  admin/        /api/admin control plane and the embedded /admin console
   webdav/       GET PUT DELETE HEAD PROPFIND MKCOL MOVE COPY (§7)
   s3/           ListBuckets / ListObjects / Get / Put / Delete / Head + SigV4 (§8, §30)
   ysync/        WebSocket Yjs/Yrs sync protocol + awareness (§9, §10)
+obsidian-plugin/  Obsidian client: manifest reconciliation + ETag conflicts + realtime feed
 web/           Tiptap + Yjs browser test client for the three protocols
 server/         the `meisync` binary and router wiring (§35)
 ```
@@ -266,6 +286,119 @@ were uploaded over WebDAV, byte for byte.
 
 ---
 
+## Admin console
+
+The node ships with an embedded administration console at **`http://127.0.0.1:8080/admin`**. It
+needs no build step or separate frontend deployment: the HTML/CSS/JS is compiled into the binary.
+
+```bash
+# recommended: pin an administrator before the first start
+MEISYNC_ADMIN_USER=admin MEISYNC_ADMIN_PASSWORD='change-me'   ./target/release/meisync --data ./data --bind 127.0.0.1:8080
+```
+
+If no administrator is configured, the **first registered account** is promoted automatically
+(disable this with `--first-user-admin=false`). An existing account can also be promoted by
+setting `MEISYNC_ADMIN_USER` to its username; `MEISYNC_ADMIN_PASSWORD` is only used when that
+account does not exist yet.
+
+The console covers:
+
+* **Overview** – users, files, content bytes, active sessions, cached YDocs, disk usage and recent
+  audit events.
+* **Users** – create accounts, promote/demote `admin`, disable/enable, reset passwords (which
+  revokes all sessions) and delete an account with an optional purge of `/private/<username>`.
+* **Files** – browse every namespace without bypassing the server on disk, preview text/binary
+  content and delete a file or collection recursively.
+* **Sessions** – list active bearer tokens and revoke one immediately.
+* **Sync devices** – every Obsidian vault that completed a handshake, with platform, plugin
+  version and last-seen time.
+* **Audit log** – logins, admin actions, account changes, device registrations and file deletes.
+* **Server** – read-only runtime configuration, storage usage, capabilities and endpoint index.
+
+Admin API (all endpoints except `login` require an `admin` bearer token):
+
+| method | path | purpose |
+|--------|------|---------|
+| `POST` | `/api/admin/login`, `/api/admin/logout` | admin session |
+| `GET`  | `/api/admin/me`, `/api/admin/overview`, `/api/admin/status` | identity and runtime picture |
+| `GET`/`POST` | `/api/admin/users` | list / create accounts |
+| `PATCH`/`DELETE` | `/api/admin/users/{id}` | role, disabled flag, password reset, delete/purge |
+| `GET`  | `/api/admin/sessions`, `/api/admin/devices`, `/api/admin/audit` | activity views |
+| `DELETE` | `/api/admin/sessions/{id}`, `/api/admin/devices/{user_id}/{device_id}` | revoke / forget |
+| `GET`/`DELETE` | `/api/admin/files` | browse / delete any namespace path |
+| `GET`  | `/api/admin/file?path=...` | materialised content of one file |
+
+The admin role is stored on the account row; disabling an account invalidates its tokens on the
+next request. Session rows carry a masked prefix and an opaque id, never the bearer token itself.
+The console itself is a static asset; only the API is protected. See
+[`docs/admin.md`](docs/admin.md) for the complete reference.
+
+---
+
+## Obsidian sync plugin
+
+[`obsidian-plugin/`](obsidian-plugin/) is a **hybrid** Obsidian client built for this node:
+
+* **Open Markdown notes use real YSync/Yjs**: the shared `Y.Text("content")` is edited
+  character-by-character through `ws://.../ysync/<path>`, alongside the web/Tiptap client and
+  other hybrid Obsidian clients.
+* **Closed notes, attachments and `.obsidian` config use file-level sync**: recursive
+  **manifest**, ETag-conditional whole-file upload/download, **move**/**mkdir**, conflict copies
+  and a **WebSocket change feed**. The feed also announces YSync edits once they are materialised,
+  so a closed copy of a note on another device updates immediately instead of waiting for its next
+  manifest poll.
+* While a note is open, the file-level engine ignores its path, so a whole-file PUT can never
+  overwrite a CRDT edit.
+* **Device registration** makes each vault visible in the admin console.
+* Configurable initial-sync mode, include/exclude rules, attachment size limits and conflict
+  strategy.
+
+The hybrid realtime switch lives in the plugin settings; disabling it reverts the whole vault to
+file-level sync.
+
+```bash
+cd obsidian-plugin
+npm install
+npm run build          # -> dist/ (main.js + manifest.json + styles.css)
+```
+
+Copy the contents of `dist/` into
+`<vault>/.obsidian/plugins/meisync-obsidian/`, enable **MeiSync** in Obsidian's community plugins,
+then set the server URL and account in the plugin settings. The remote folder defaults to
+`obsidian/<vault name>` under `/private/<username>`.
+
+Sync API:
+
+| method | path | purpose |
+|--------|------|---------|
+| `GET`  | `/api/sync/info` | protocol version and capabilities |
+| `POST` | `/api/sync/handshake` | resolve the vault root, register the device |
+| `GET`  | `/api/sync/manifest?vault=...` | recursive relative manifest (`ETag` = revision) |
+| `GET`/`PUT`/`DELETE` | `/api/sync/file?vault=...&path=...` | content with conditional ETags |
+| `POST` | `/api/sync/move`, `/api/sync/mkdir` | rename/move and folder creation |
+| `GET`/`POST` | `/api/sync/devices` | list/register sync devices |
+| `GET`  | `/api/sync/ws?vault=...` | WebSocket change feed (`ready`, `change`, `resync`) |
+
+The vault root is always interpreted **relative to `/private/<username>`**; absolute paths and
+`..` are rejected. The server still enforces the normal owner permissions, so a token can never
+address another user's namespace through the sync API. See
+[`docs/obsidian-sync.md`](docs/obsidian-sync.md) for the hybrid model, YSync bridge, conflict
+rules and protocol details.
+
+### Releases
+
+`.github/workflows/plugin-release.yml` runs on a `plugin-v<version>` tag, checks that the tag
+matches `obsidian-plugin/manifest.json`, and publishes a GitHub release containing `main.js`,
+`manifest.json` and `styles.css` (the assets Obsidian and BRAT download) plus
+`meisync-obsidian-<version>.zip` for manual installs. A manual `workflow_dispatch` builds the zip
+as a workflow artifact without creating a release.
+
+```bash
+git tag plugin-v0.2.1 && git push origin plugin-v0.2.1
+```
+
+---
+
 ## Tests
 
 ```bash
@@ -289,6 +422,11 @@ cargo test --workspace
 * `server/tests/ysync.rs` – two real WebSocket clients converging through the sync protocol,
   awareness relay, incremental vs full-state transfer, delete/rename notifications, permission
   rejection and restart persistence.
+* `server/tests/admin.rs` – admin login, role gating, user lifecycle (disable/password
+  reset/delete+purge), sessions, audit and cross-namespace file browsing.
+* `server/tests/sync.rs` – vault provisioning, manifest, conditional ETag conflicts,
+  move/delete, device registration, namespace scoping and the WebSocket change feed.
+* `obsidian-plugin/tests` – pure planner, path/exclusion and text-diff rules (`npm test`).
 * `server/tests/persistence.rs` – restart recovery, compaction, full-sync documents, concurrent
   writes, cache eviction, `/api/status`.
 * `server/tests/api.rs` – accounts, tokens, JSON file API, namespace bootstrap, path traversal.
@@ -296,7 +434,9 @@ cargo test --workspace
 ## MVP scope (§38)
 
 Not implemented on purpose: clustering, distributed YDocs, Redis/Kafka, PostgreSQL, external S3
-storage, complex ACL, OAuth/OIDC, multi-tenancy, version history UI, full text search. The
-abstractions that would carry them (`DocumentStore`, `PermissionService`, `FileService`, `Room`)
+storage, complex ACL, OAuth/OIDC, multi-tenancy, version history UI, full text search. The admin
+console is intentionally an operational tool, not a collaborative document editor. The Obsidian
+plugin now uses YSync for open Markdown notes and file-level sync for everything else; it does not
+try to make attachments or `.obsidian` config collaborative. The abstractions that would carry them (`DocumentStore`, `PermissionService`, `FileService`, `Room`)
 are already factored out so a `PostgresDocumentStore` or a distributed room can replace the local
 implementation without touching the protocol layers.

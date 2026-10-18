@@ -6,12 +6,17 @@
 //! * [`routes`] is the small JSON control plane (`/api/...`).
 
 pub mod error;
+pub mod events;
 pub mod extract;
 pub mod routes;
 pub mod service;
 pub mod state;
+pub mod sync;
 
 pub use error::{ApiError, FileInfo};
+pub use events::{ChangeHub, ChangeKind, FileChange};
 pub use extract::{AuthToken, AuthUser, MaybeAuthUser};
-pub use service::{CreateFileSpec, DefaultFileService, Depth, FileService, Listing, RecursiveListSpec};
+pub use service::{
+    CreateFileSpec, DefaultFileService, Depth, FileService, Listing, RecursiveListSpec,
+};
 pub use state::{AppState, ServerConfig};

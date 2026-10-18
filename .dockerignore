@@ -1,0 +1,9 @@
+.git
+.jj
+.github
+target
+data
+web
+obsidian-plugin
+docs
+**/*.rs.bk
