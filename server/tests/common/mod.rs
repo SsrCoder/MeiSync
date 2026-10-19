@@ -24,6 +24,11 @@ impl Harness {
     }
 
     pub async fn in_dir(dir: Option<PathBuf>) -> Harness {
+        Harness::with_config(dir, |_| {}).await
+    }
+
+    /// Spawn a node and let the caller tweak the configuration (limits, flags).
+    pub async fn with_config(dir: Option<PathBuf>, tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
         let temp = match dir {
             Some(_) => None,
             None => Some(TempDir::new().expect("temp dir")),
@@ -32,10 +37,11 @@ impl Harness {
             Some(dir) => dir.path().to_path_buf(),
             None => dir.expect("data dir"),
         };
-        let config = ServerConfig {
+        let mut config = ServerConfig {
             data_dir,
             ..Default::default()
         };
+        tweak(&mut config);
         let state = AppState::bootstrap(config).await.expect("bootstrap");
         let app = router(state.clone());
         Harness {

@@ -1,6 +1,7 @@
 import { App, Notice, Platform, TAbstractFile, TFile, TFolder } from 'obsidian'
 import { ConflictError, SyncApi, SyncHttpError } from './api'
 import type { SyncLog } from './log'
+import { effectiveUploadLimit } from './sync/limits'
 import { plan, type PlanAction, type PlanResult } from './sync/planner'
 import {
   conflictPath,
@@ -92,6 +93,8 @@ export class SyncEngine {
   private skippedPaths = new Set<string>()
   private excludedRemotePaths = new Set<string>()
   private root = ''
+  /** `max_body_bytes` advertised by the node; 0 until the first handshake answers. */
+  private serverMaxBodyBytes = 0
   private moveInFlight = new Set<string>()
   /** Paths this round wrote to disk itself; their fresh stat is not a mid-round user edit. */
   private roundWrites = new Set<string>()
@@ -699,7 +702,13 @@ export class SyncEngine {
       state.lastManifestRevision = undefined
     }
     state.lastRoot = handshake.root
+    const advertised = Number(handshake.max_body_bytes)
+    if (Number.isFinite(advertised) && advertised > 0 && advertised !== this.serverMaxBodyBytes) {
+      this.serverMaxBodyBytes = advertised
+      this.options.log.info(`server accepts uploads up to ${formatBytes(advertised)}`)
+    }
   }
+
 
   // -----------------------------------------------------------------------------------------
   // manifests / local scan
@@ -715,7 +724,7 @@ export class SyncEngine {
 
   private mapRemote(manifest: RemoteManifest, settings: MeiSyncSettings): Map<string, RemoteEntry> {
     const remote = new Map<string, RemoteEntry>()
-    const maxBytes = Math.max(1, Number(settings.maxFileSizeMb) || 32) * 1024 * 1024
+    const maxBytes = effectiveUploadLimit(settings.maxFileSizeMb, this.serverMaxBodyBytes)
     for (const entry of manifest.entries) {
       let path: string
       try {
@@ -741,7 +750,7 @@ export class SyncEngine {
       if (mapped.kind === 'file' && mapped.size > maxBytes) {
         this.skippedPaths.add(path)
         this.options.log.warn(
-          `skipping ${path}: ${formatBytes(mapped.size)} exceeds the ${settings.maxFileSizeMb} MB client limit`,
+          `skipping ${path}: ${formatBytes(mapped.size)} exceeds the ${formatBytes(maxBytes)} upload limit`,
         )
       }
       remote.set(path, mapped)
@@ -751,7 +760,7 @@ export class SyncEngine {
 
   private async scanLocal(settings: MeiSyncSettings): Promise<Map<string, LocalEntry>> {
     const local = new Map<string, LocalEntry>()
-    const maxBytes = Math.max(1, Number(settings.maxFileSizeMb) || 32) * 1024 * 1024
+    const maxBytes = effectiveUploadLimit(settings.maxFileSizeMb, this.serverMaxBodyBytes)
     const vault = this.options.app.vault
     for (const abstract of vault.getAllLoadedFiles()) {
       let path: string
@@ -771,7 +780,7 @@ export class SyncEngine {
         if (abstract.stat.size > maxBytes) {
           this.skippedPaths.add(path)
           this.options.log.warn(
-            `skipping ${path}: ${formatBytes(abstract.stat.size)} exceeds the ${settings.maxFileSizeMb} MB client limit`,
+            `skipping ${path}: ${formatBytes(abstract.stat.size)} exceeds the ${formatBytes(maxBytes)} upload limit`,
           )
         }
         local.set(path, {
@@ -1016,6 +1025,16 @@ export class SyncEngine {
       if (error instanceof ConflictError) {
         this.options.log.warn(`${path} changed remotely while uploading; resolving conflict`)
         await this.resolveUploadConflict(path, data, context)
+        return
+      }
+      if (error instanceof SyncHttpError && error.status === 413) {
+        // The node refused the body size. Retrying cannot help and only spams the log, so treat
+        // the file like any other skipped path until the limits change.
+        this.skippedPaths.add(path)
+        context.summary.skipped += 1
+        this.options.log.warn(
+          `skipping ${path}: ${formatBytes(data.byteLength)} exceeds the server upload limit (HTTP 413)`,
+        )
         return
       }
       throw error

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- **Attachment uploads above 2 MB no longer fail with `413 Failed to buffer the request body`.**
+  The node's `Bytes`/`Json` extractors were still on axum's 2 MB `DefaultBodyLimit`, so the
+  `--max-body-mb` knob (64 MB by default) only ever bounded the raw stream, not the extractor.
+  The limit is now applied once, in `server::router`, and covers `/api/files`, `/api/sync/file`
+  and every other body-reading route.
+- The plugin now honours the node's advertised `max_body_bytes` from the handshake: the effective
+  upload limit is `min(Maximum file size, server limit)`, so a node with a smaller body limit
+  produces one clear skip message instead of a 413 for the same file on every round.
+
 ## 0.2.1
 
 - `npm run build` now writes a ready-to-copy plugin folder to `dist/` (`main.js`,

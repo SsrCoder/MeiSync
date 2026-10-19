@@ -62,6 +62,9 @@ ws://127.0.0.1:8080/ysync/private/alice/notes/todo.md?token=$TOKEN
 
 `meisync --help` lists every option (`--public-default-write`, `--max-cache-documents`,
 `--idle-unload-secs`, `--compact-after-updates`, `--compact-after-bytes`, `--dav-at-root`, …).
+`--max-body-mb` (64 by default) is the single upload limit for every protocol — WebDAV `PUT`,
+S3 `PutObject`, `PUT /api/files` and `PUT /api/sync/file` — and is advertised to clients as
+`max_body_bytes` in `/api/sync/info` and the sync handshake.
 
 ### Docker
 
@@ -394,7 +397,7 @@ matches `obsidian-plugin/manifest.json`, and publishes a GitHub release containi
 as a workflow artifact without creating a release.
 
 ```bash
-git tag plugin-v0.2.1 && git push origin plugin-v0.2.1
+git tag plugin-v0.2.2 && git push origin plugin-v0.2.2
 ```
 
 ---

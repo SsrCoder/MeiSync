@@ -7,7 +7,7 @@
 //! /ysync/... Yjs/Yrs sync    (§9, §10)
 //! ```
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -35,6 +35,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .merge(meisync_s3::router())
         .merge(meisync_s3::router_at_root())
         .merge(meisync_ysync::router())
+        // `Bytes`/`Json` extractors enforce `DefaultBodyLimit` (2 MB by default) on their own,
+        // independently of the tower-http limit. Without raising it here every attachment
+        // upload above 2 MB fails with `413 Failed to buffer the request body`.
+        .layer(DefaultBodyLimit::max(max_body))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TraceLayer::new_for_http());
 

@@ -51,7 +51,7 @@ Enable **MeiSync** under *Settings → Community plugins*, then open its setting
 | Real-time Markdown (YSync) | on | open Markdown notes sync through YSync character-by-character; off means purely file-level |
 | Sync attachments | on | include binary files; off syncs text-like notes only |
 | Sync `.obsidian` | off | include config, themes and snippets. The MeiSync plugin folder, `workspace.json`, `workspace-mobile.json` and cache are always excluded. Other plugins' `data.json` files may contain credentials; review them before enabling |
-| Maximum file size | 32 MB | client-side skip limit; the server body limit still applies |
+| Maximum file size | 32 MB | client-side skip limit; the effective limit is the smaller of this and the node's `max_body_bytes` (`--max-body-mb`, 64 MB by default) |
 | Exclude patterns | – | one glob per line (`*`, `**`, `?`); `#` starts a comment |
 | Conflict strategy | Keep both | `duplicate`, `manual`, `local-wins`, `remote-wins` |
 | Initial sync mode | Merge | what to do when a path exists on both sides without a baseline |
@@ -217,6 +217,8 @@ namespace.
 * A failed action is removed from the baseline and retried next round; successful actions keep
   their incremental baseline update.
 * Files above the size limit or excluded patterns are reported once per round and left untouched.
+  The limit is `min(client "Maximum file size", server max_body_bytes)`, so a node configured
+  with a smaller body limit never produces endless `413` retries.
 * A remote folder is **not** deleted recursively when it contains excluded, oversized or
   failed-to-sync descendants; the delete is skipped and logged so the plugin never destroys data
   it was not tracking.

@@ -466,3 +466,114 @@ async fn websocket_feed_announces_file_changes() {
     let _ = socket.close(None).await;
     server.abort();
 }
+
+/// Binaries (images, PDFs) are ordinary uploads: a body above axum's 2 MiB extractor default must
+/// still be accepted, otherwise every attachment larger than a screenshot fails with
+/// `413 Failed to buffer the request body`.
+#[tokio::test]
+async fn attachments_above_the_default_extractor_limit_are_uploaded() {
+    let harness = Harness::spawn().await;
+    let token = harness.register("alice").await;
+    handshake(&harness, &token, "obsidian/MyVault").await;
+
+    let payload: Vec<u8> = (0..(3 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    let response = harness
+        .send(
+            harness.request_with_body(
+                "PUT",
+                &sync_url("file", "obsidian/MyVault", "Attachments/Images/3mb.png"),
+                Some(&token),
+                Some("image/png"),
+                payload.clone(),
+            ),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        body_string(response).await
+    );
+    let uploaded: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(uploaded["size"], payload.len());
+
+    // The bytes survive a round trip.
+    let response = harness
+        .send(harness.request(
+            "GET",
+            &sync_url("file", "obsidian/MyVault", "Attachments/Images/3mb.png"),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], payload.len().to_string());
+    assert_eq!(body_bytes(response).await, payload);
+
+    // Same story on the plain file API.
+    let response = harness
+        .send(harness.request_with_body(
+            "PUT",
+            "/api/files/private/alice/paper.pdf",
+            Some(&token),
+            Some("application/pdf"),
+            payload.clone(),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        body_string(response).await
+    );
+    let uploaded: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(uploaded["size"], payload.len());
+}
+
+/// `max_body_bytes` (CLI `--max-body-mb`) is the single limit every protocol enforces.
+#[tokio::test]
+async fn uploads_follow_the_configured_body_limit() {
+    let harness = Harness::with_config(None, |config| {
+        config.max_body_bytes = 1024 * 1024;
+    })
+    .await;
+    let token = harness.register("alice").await;
+    handshake(&harness, &token, "obsidian/MyVault").await;
+
+    let payload = vec![0u8; 2 * 1024 * 1024];
+    let response = harness
+        .send(harness.request_with_body(
+            "PUT",
+            &sync_url("file", "obsidian/MyVault", "big.bin"),
+            Some(&token),
+            Some("application/octet-stream"),
+            payload.clone(),
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        body_string(response).await
+    );
+
+    // Just under the limit is fine.
+    let response = harness
+        .send(harness.request_with_body(
+            "PUT",
+            &sync_url("file", "obsidian/MyVault", "small.bin"),
+            Some(&token),
+            Some("application/octet-stream"),
+            vec![0u8; 512 * 1024],
+        ))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        body_string(response).await
+    );
+
+    // The advertised handshake limit matches the configuration.
+    let hs = handshake(&harness, &token, "obsidian/MyVault").await;
+    assert_eq!(hs["max_body_bytes"], 1024 * 1024);
+}
