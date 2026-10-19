@@ -1,6 +1,6 @@
 {
   "name": "meisync-obsidian",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "Obsidian client for a self-hosted MeiSync node",
   "type": "module",

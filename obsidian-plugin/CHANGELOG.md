@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.3
+
+- **The status bar now reuses Obsidian's own sync status icon.** When the core Sync plugin is
+  enabled, the indicator is rendered *inside* its status bar item (`status-bar-item-segment` →
+  `status-bar-item-icon sync-status-icon`, core's `sync-small` / `check-small` / `paused` /
+  `refresh-cw-off` icons and `mod-working` / `mod-success` / `mod-error` / `mod-spin` colours), so
+  the bar keeps a single sync icon; a plugin-owned item is only created when core Sync is off, and
+  toggling core Sync is followed live (no restart needed). The state is in the hover tooltip;
+  clicking the icon still opens the sync log (the core menu is not triggered).
+- On mobile the indicator is a right-sidebar header button with the same icon and colours, which
+  is the affordance core Sync uses there (mobile has no status bar).
+- **Remote YSync edits no longer move the reading client's scrollbar.** Realtime updates were
+  applied with `Editor.transaction()`, which Obsidian always dispatches with
+  `scrollIntoView: true`; every incoming edit from another device therefore scrolled each open
+  pane back to that pane's cursor, even when the user was reading somewhere else in the note.
+  The change is now dispatched on the underlying CodeMirror 6 view with `scrollIntoView: false`,
+  so the viewport (and the cursor, which CodeMirror maps through the change itself) stays put.
+  The public transaction API is still used as a fallback, with the scroll position restored
+  around it.
+
 ## 0.2.2
 
 - **Attachment uploads above 2 MB no longer fail with `413 Failed to buffer the request body`.**

@@ -3,8 +3,9 @@ import * as Y from 'yjs'
 import { Awareness } from 'y-protocols/awareness'
 import type { SyncEngine } from './engine'
 import type { SyncLog } from './log'
+import { applyPatchKeepingViewport } from './sync/editor-apply'
 import { isExcluded, normalizeBaseUrl, normalizeVaultPath } from './sync/paths'
-import { diffRange, mapOffset } from './sync/text-diff'
+import { diffRange } from './sync/text-diff'
 import { MeiSyncProvider, ysyncUrl } from './sync/ysync-provider'
 import type { MeiSyncSettings } from './types'
 
@@ -507,33 +508,14 @@ export class HybridSyncManager {
           if (current === shared) continue
           const patch = diffRange(current, shared)
           if (!patch) continue
-          const from = editor.offsetToPos(patch.index)
-          const to =
-            patch.deleteCount > 0 ? editor.offsetToPos(patch.index + patch.deleteCount) : from
-          const selections = editor.listSelections().map((selection) => ({
-            from: editor.offsetToPos(mapOffset(editor.posToOffset(selection.anchor), patch)),
-            to: editor.offsetToPos(mapOffset(editor.posToOffset(selection.head), patch)),
-          }))
           try {
-            editor.transaction(
-              {
-                changes: [{ from, to, text: patch.insert }],
-                selections,
-              },
-              'meisync-ysync',
-            )
+            // Never use editor.transaction() here: it always scrolls the view to the cursor, so a
+            // remote edit would move the reading position of this client.
+            applyPatchKeepingViewport(editor, patch, 'meisync-ysync')
           } catch (error) {
-            // A stale selection should never block the text update.
-            this.log.warn(
-              `could not apply realtime selection update: ${error instanceof Error ? error.message : String(error)}`,
+            this.log.error(
+              `could not apply realtime update: ${error instanceof Error ? error.message : String(error)}`,
             )
-            try {
-              editor.transaction({ changes: [{ from, to, text: patch.insert }] }, 'meisync-ysync')
-            } catch (retry) {
-              this.log.error(
-                `could not apply realtime update: ${retry instanceof Error ? retry.message : String(retry)}`,
-              )
-            }
           }
         } catch (error) {
           this.log.warn(

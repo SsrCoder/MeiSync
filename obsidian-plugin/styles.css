@@ -1,18 +1,8 @@
+/* The status bar item reuses Obsidian's own sync indicator markup
+   (`.status-bar-item-segment` + `.status-bar-item-icon.sync-status-icon` with `mod-*`
+   modifiers), so only the clickable affordance is plugin-specific. */
 .meisync-status {
   cursor: pointer;
-  font-variant-numeric: tabular-nums;
-}
-
-.meisync-status.is-syncing {
-  color: var(--text-accent);
-}
-
-.meisync-status.is-error {
-  color: var(--text-error);
-}
-
-.meisync-status.is-offline {
-  color: var(--text-muted);
 }
 
 .meisync-log-modal {
