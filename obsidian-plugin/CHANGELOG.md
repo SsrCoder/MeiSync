@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4
+
+- **The sync indicator now reuses Obsidian's own icon element instead of adding a second icon.**
+  On desktop the plugin drives the icon that lives inside the core Sync status bar item (and keeps
+  following that item when core Sync is toggled); on mobile it drives the core Sync right-sidebar
+  header button. A plugin-owned indicator is only created when core Sync has none at all. If core
+  Sync rewrites its own state, the plugin re-asserts the MeiSync state on the next mutation.
+- **Idle rounds no longer flip the icon.** `syncing` is only reported once a round actually has
+  actions to perform, so the interval timer's "nothing changed" rounds leave the icon (and its
+  tooltip) untouched.
+
 ## 0.2.3
 
 - **The status bar now reuses Obsidian's own sync status icon.** When the core Sync plugin is

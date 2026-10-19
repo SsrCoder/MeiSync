@@ -18,15 +18,30 @@ export default class MeiSyncPlugin extends Plugin {
   log = new SyncLog()
   engine!: SyncEngine
   hybrid: HybridSyncManager | null = null
-  /** Status bar item owned by this plugin; only used when core Sync has no indicator. */
+  /** Status bar item owned by this plugin; only used when core Sync has no icon. */
   private ownStatusBarEl: HTMLElement | null = null
-  /** Element the indicator currently lives in (core Sync's item or our own). */
+  /** Element the plugin-owned indicator lives in (its own item, or core Sync's item). */
   private statusHostEl: HTMLElement | null = null
+  /** Clickable element created by this plugin (carries the tooltip). */
   private statusSegmentEl: HTMLElement | null = null
+  /** Icon element currently driven by the plugin (our span or core Sync's icon). */
   private statusIconEl: HTMLElement | null = null
+  /** Core Sync's icon element while it is reused instead of adding a duplicate icon. */
+  private coreIconEl: HTMLElement | null = null
+  private coreIconObserver: MutationObserver | null = null
   private statusObserver: MutationObserver | null = null
+  private mobileDrawer: MobileDrawerHost | null = null
+  private mobileHeader: HTMLElement | null = null
+  private mobileButtonEl: HTMLElement | null = null
+  private mobileObserver: MutationObserver | null = null
   private lastStatus: SyncStatus = 'idle'
   private lastDetail: string | undefined
+
+  /** Open the log instead of letting core Sync open its menu for clicks on its status bar item. */
+  private readonly statusClick = (event: MouseEvent): void => {
+    event.stopPropagation()
+    this.showLog()
+  }
 
   override async onload(): Promise<void> {
     await this.loadPluginData()
@@ -123,11 +138,12 @@ export default class MeiSyncPlugin extends Plugin {
   override onunload(): void {
     this.statusObserver?.disconnect()
     this.statusObserver = null
+    this.mobileObserver?.disconnect()
+    this.mobileObserver = null
     // Our own item is removed by the plugin lifecycle; a segment living inside core Sync's item
-    // is ours to clean up.
-    this.statusSegmentEl?.detach()
-    this.statusSegmentEl = null
-    this.statusIconEl = null
+    // is ours to clean up, and core Sync's icon element stays theirs.
+    this.releaseIndicator()
+    this.mobileButtonEl = null
     this.hybrid?.stop()
     this.engine?.stop()
     // Best effort: persist the baseline even if the user disables the plugin mid-session.
@@ -222,18 +238,26 @@ export default class MeiSyncPlugin extends Plugin {
     this.renderStatus()
   }
 
+  /**
+   * Render the state onto whichever icon element is currently in use.
+   *
+   * Writes are skipped when the element already looks right: the element may be Obsidian's core
+   * Sync icon, which core keeps rewriting, and a non-idempotent render would loop with the
+   * re-assertion observer below.
+   */
   private renderStatus(): void {
     const icon = this.statusIconEl
-    const segment = this.statusSegmentEl
-    if (!icon || !segment) return
+    if (!icon) return
     const appearance = statusAppearance(this.lastStatus, this.settings)
     setIcon(icon, appearance.icon)
-    icon.removeClass('mod-success', 'mod-working', 'mod-error', 'mod-spin')
-    icon.addClass(...appearance.modifiers)
+    for (const modifier of STATUS_MODIFIERS) {
+      const wanted = appearance.modifiers.includes(modifier)
+      if (icon.hasClass(modifier) !== wanted) icon.toggleClass(modifier, wanted)
+    }
+    const target = this.statusSegmentEl ?? icon
     const detail = this.lastDetail
-    setTooltip(segment, detail ? `${appearance.label} — ${detail}` : appearance.label, {
-      placement: 'top',
-    })
+    const label = detail ? `${appearance.label} — ${detail}` : appearance.label
+    if (target.getAttribute('aria-label') !== label) setTooltip(target, label, { placement: 'top' })
   }
 
   private statusBarContainer(): HTMLElement | null {
@@ -249,10 +273,52 @@ export default class MeiSyncPlugin extends Plugin {
     return container.querySelector<HTMLElement>('.status-bar-item.plugin-sync')
   }
 
+  /** Core Sync's own icon, ignoring the one this plugin created. */
+  private findCoreSyncIcon(root: ParentNode | null): HTMLElement | null {
+    if (!root) return null
+    for (const icon of Array.from(root.querySelectorAll<HTMLElement>('.sync-status-icon'))) {
+      if (!icon.closest('.meisync-status')) return icon
+    }
+    return null
+  }
+
   /**
-   * Put the indicator into Obsidian's own sync status bar item so the bar keeps a single sync
-   * icon, and only create a plugin-owned item when core Sync is off. Core Sync creates/destroys
-   * its item when the user toggles it, which {@link observeStatusBar} follows.
+   * Drive core Sync's icon element itself, so the bar keeps exactly one sync icon. Core Sync is
+   * free to update it again; the observer re-asserts our state right after such a write.
+   */
+  private adoptIcon(icon: HTMLElement): void {
+    if (this.coreIconEl === icon) {
+      this.renderStatus()
+      return
+    }
+    this.releaseIndicator()
+    this.coreIconEl = icon
+    this.statusIconEl = icon
+    icon.addEventListener('click', this.statusClick)
+    this.coreIconObserver = new MutationObserver(() => this.renderStatus())
+    this.coreIconObserver.observe(icon, {
+      childList: true,
+      attributes: true,
+      attributeFilter: ['class'],
+    })
+    this.renderStatus()
+  }
+
+  private releaseIndicator(): void {
+    this.coreIconObserver?.disconnect()
+    this.coreIconObserver = null
+    this.coreIconEl?.removeEventListener('click', this.statusClick)
+    this.coreIconEl = null
+    this.statusSegmentEl?.detach()
+    this.statusSegmentEl = null
+    this.statusIconEl = null
+    this.statusHostEl = null
+  }
+
+  /**
+   * Desktop indicator: reuse core Sync's icon when it exists (no duplicate icon), and fall back to
+   * a status bar item of our own when core Sync is off. Core Sync creates/destroys its item when
+   * the user toggles it, which {@link observeStatusBar} follows.
    */
   private mountStatusBar(): void {
     if (!this.ownStatusBarEl) return
@@ -264,15 +330,21 @@ export default class MeiSyncPlugin extends Plugin {
       // Core Sync removed its item again (or none was ever there).
       document.querySelector<HTMLElement>('.status-bar')?.appendChild(this.ownStatusBarEl)
     }
+
+    const coreIcon = this.findCoreSyncIcon(coreItem)
+    if (coreIcon) {
+      this.adoptIcon(coreIcon)
+      return
+    }
+
     const host = coreItem ?? this.ownStatusBarEl
-    if (this.statusHostEl === host && this.statusSegmentEl?.parentElement === host) return
-    this.statusSegmentEl?.detach()
+    if (this.statusHostEl === host && this.statusSegmentEl?.parentElement === host) {
+      this.renderStatus()
+      return
+    }
+    this.releaseIndicator()
     const segment = host.createDiv('status-bar-item-segment meisync-status')
-    // Core Sync opens its own menu for clicks that reach its status bar item; keep ours separate.
-    segment.addEventListener('click', (event) => {
-      event.stopPropagation()
-      this.showLog()
-    })
+    segment.addEventListener('click', this.statusClick)
     segment.addEventListener('contextmenu', (event) => event.stopPropagation())
     this.statusSegmentEl = segment
     this.statusIconEl = segment.createSpan('status-bar-item-icon sync-status-icon')
@@ -281,24 +353,52 @@ export default class MeiSyncPlugin extends Plugin {
   }
 
   /**
-   * Mobile counterpart of the status bar icon: Obsidian's core Sync renders a right-sidebar
-   * header button there (`WorkspaceMobileDrawer.addHeaderButton`, still undocumented), and so do
-   * we — same icon, same `sync-status-icon` colours.
+   * Mobile counterpart: core Sync renders its indicator as a right-sidebar header button there,
+   * so reuse that button when it exists and only create our own when it does not.
    */
   private mountMobileStatus(): void {
-    if (this.statusIconEl) return
-    const drawer = this.app.workspace.rightSplit as unknown as {
-      addHeaderButton?: (icon: string, callback: (event: MouseEvent) => unknown) => HTMLElement
-    }
+    const drawer = this.app.workspace.rightSplit as unknown as MobileDrawerHost
     if (typeof drawer.addHeaderButton !== 'function') {
       this.log.warn('the mobile sidebar exposes no header buttons; the sync indicator is disabled')
       return
     }
-    const button = drawer.addHeaderButton('sync-small', () => this.showLog())
-    button.addClass('meisync-status', 'sync-status-icon')
-    this.statusIconEl = button
-    this.statusSegmentEl = button
-    this.renderStatus()
+    this.mobileDrawer = drawer
+    this.mobileHeader = drawer.containerEl?.querySelector<HTMLElement>('.workspace-drawer-header') ?? null
+    this.mountMobileIndicator()
+    const header = this.mobileHeader
+    if (header && !this.mobileObserver) {
+      // Core Sync adds its header button on layout ready and removes it when it is disabled; watch
+      // the drawer header (not the whole drawer) so the file tree inside it cannot spam us.
+      this.mobileObserver = new MutationObserver(() => this.mountMobileIndicator())
+      this.mobileObserver.observe(header, { childList: true, subtree: true })
+    }
+  }
+
+  private mountMobileIndicator(): void {
+    const drawer = this.mobileDrawer
+    if (!drawer) return
+    const coreIcon = this.findCoreSyncIcon(this.mobileHeader ?? drawer.containerEl ?? null)
+    if (coreIcon) {
+      if (this.mobileButtonEl) {
+        this.mobileButtonEl.detach()
+        this.mobileButtonEl = null
+      }
+      this.adoptIcon(coreIcon)
+      return
+    }
+    if (this.coreIconEl) this.releaseIndicator()
+    if (this.mobileButtonEl && !this.mobileButtonEl.isConnected) this.mobileButtonEl = null
+    if (!this.mobileButtonEl) {
+      if (typeof drawer.addHeaderButton !== 'function') return
+      const button = drawer.addHeaderButton('sync-small', () => this.showLog())
+      button.addClass('meisync-status', 'sync-status-icon')
+      this.mobileButtonEl = button
+    }
+    if (this.statusIconEl !== this.mobileButtonEl) {
+      this.statusIconEl = this.mobileButtonEl
+      this.statusSegmentEl = this.mobileButtonEl
+      this.renderStatus()
+    }
   }
 
   private observeStatusBar(): void {
@@ -307,6 +407,15 @@ export default class MeiSyncPlugin extends Plugin {
     this.statusObserver = new MutationObserver(() => this.mountStatusBar())
     this.statusObserver.observe(container, { childList: true, subtree: true })
   }
+}
+
+/** Class set core Sync's `_updateStatusBar` toggles on its icon. */
+const STATUS_MODIFIERS = ['mod-success', 'mod-working', 'mod-error', 'mod-spin'] as const
+
+/** Undocumented mobile drawer surface used by core Sync for its header button. */
+interface MobileDrawerHost {
+  containerEl?: HTMLElement
+  addHeaderButton?: (icon: string, callback: (event: MouseEvent) => unknown) => HTMLElement
 }
 
 /** Icon + colour for a status, matching `SyncPlugin._updateStatusBar` in Obsidian core. */

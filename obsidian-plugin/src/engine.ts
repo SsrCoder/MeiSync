@@ -501,7 +501,6 @@ export class SyncEngine {
     this.skippedPaths = new Set()
     this.excludedRemotePaths = new Set()
     this.roundWrites = new Set()
-    this.setStatus('syncing', reason)
     this.options.log.info(`sync started (${reason})`)
 
     const settings = this.options.getSettings()
@@ -550,6 +549,10 @@ export class SyncEngine {
       if (settings.debug && actions.length) {
         for (const action of actions) this.options.log.info(`  ${describeAction(action)}`)
       }
+      // Only announce a running sync when there is work to do. Interval rounds that find nothing
+      // to transfer are the common case, and flipping the status icon (and back) every tick is
+      // pure noise.
+      if (actions.length > 0) this.setStatus('syncing', reason)
 
       for (const action of actions) {
         if (this.stopped) {

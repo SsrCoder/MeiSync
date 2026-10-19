@@ -397,7 +397,7 @@ matches `obsidian-plugin/manifest.json`, and publishes a GitHub release containi
 as a workflow artifact without creating a release.
 
 ```bash
-git tag plugin-v0.2.3 && git push origin plugin-v0.2.3
+git tag plugin-v0.2.4 && git push origin plugin-v0.2.4
 ```
 
 ---

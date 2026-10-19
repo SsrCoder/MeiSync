@@ -3,7 +3,7 @@ name: Obsidian plugin release
 # Builds the Obsidian plugin and publishes a GitHub release.
 #
 # Push a tag that matches the version in obsidian-plugin/manifest.json:
-#   git tag plugin-v0.2.3 && git push origin plugin-v0.2.3
+#   git tag plugin-v0.2.4 && git push origin plugin-v0.2.4
 #
 # The release contains the three files Obsidian/BRAT expect on the latest release
 # (main.js, manifest.json, styles.css) plus a ready-to-copy zip.
