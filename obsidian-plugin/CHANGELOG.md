@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.5
+
+- **A rename on one device no longer turns the note into two files on another.** A server MOVE only
+  changes `parent_id`/`name`, so the manifest keeps reporting the same `file_id` and ETag under the
+  new path — but the plugin never read `file_id`, so a client that was closed (or merely idle)
+  during the rename saw "the old path was deleted" and "an unrelated new file appeared". If its
+  local copy of the old path had drifted at all (an edit, or just an mtime/size change while the
+  app was closed), that became a `local-changed-remote-deleted` conflict: the conflict copy stayed
+  at the old path *and* the renamed note was downloaded next to it.
+  The baseline now records `file_id` and the planner matches on it, emitting one `move-local`
+  action instead of a conflict. A renamed folder is moved once, and its children are remapped
+  without individual moves.
+- **A transient MOVE failure is retried instead of degrading into delete + create.** Falling back to
+  a reconcile uploaded the new path and deleted the old one, which is a *new* YDoc with a fresh
+  `file_id` — every other client then saw the same delete + create and lost the note's identity.
+  Only a terminal rejection (destination exists, or the path was never synced) falls back.
+- The engine no longer reacts to its own `vault.rename` for a remote MOVE as if the user had renamed
+  the file, which could schedule a second MOVE for a path the server had already moved.
+
 ## 0.2.4
 
 - **The sync indicator now reuses Obsidian's own icon element instead of adding a second icon.**

@@ -35,6 +35,7 @@ export interface SyncSummary {
   deletesLocal: number
   deletesRemote: number
   mkdirs: number
+  moves: number
   conflicts: number
   skipped: number
   errors: number
@@ -70,6 +71,9 @@ interface ActionContext {
 
 const MAX_CONFLICT_COPIES = 4
 
+/** How often a transient MOVE failure is retried before falling back to a reconcile. */
+const MAX_MOVE_RETRIES = 4
+
 /**
  * Vault synchronisation engine.
  *
@@ -87,6 +91,8 @@ export class SyncEngine {
   private intervalTimer: number | null = null
   private debounceTimer: number | null = null
   private reconnectTimer: number | null = null
+  /** Retry timer for a MOVE that failed for a transient reason. */
+  private moveRetryTimer: number | null = null
   private reconnectAttempt = 0
   private socket: WebSocket | null = null
   private suppressed = new Map<string, number>()
@@ -131,8 +137,10 @@ export class SyncEngine {
     this.suspended = false
     if (this.intervalTimer !== null) window.clearInterval(this.intervalTimer)
     if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer)
+    if (this.moveRetryTimer !== null) window.clearTimeout(this.moveRetryTimer)
     this.intervalTimer = null
     this.debounceTimer = null
+    this.moveRetryTimer = null
     this.unregisterWakeHandlers()
     this.disconnectRealtime()
     this.setStatus('disabled')
@@ -372,6 +380,7 @@ export class SyncEngine {
           mtime: file.stat.mtime,
           version: remote.version,
           content_type: remote.content_type,
+          file_id: remote.file_id,
         }
         this.options.getState().lastManifestRevision = manifest.revision
         await this.persist()
@@ -398,6 +407,7 @@ export class SyncEngine {
         mtime: -1,
         version: remote.version,
         content_type: remote.content_type,
+        file_id: remote.file_id,
       }
       await this.persist()
       const summary = await this.runTargetedSync(normalized, 'realtime close')
@@ -461,6 +471,7 @@ export class SyncEngine {
           mtime: file.stat.mtime,
           version: remote.version,
           content_type: remote.content_type,
+          file_id: remote.file_id,
         }
         state.lastManifestRevision = manifest.revision
       } else if (!remote) {
@@ -492,6 +503,7 @@ export class SyncEngine {
       deletesLocal: 0,
       deletesRemote: 0,
       mkdirs: 0,
+      moves: 0,
       conflicts: 0,
       skipped: 0,
       errors: 0,
@@ -542,6 +554,15 @@ export class SyncEngine {
         initialSync: settings.initialSync,
       })
       const context: ActionContext = { vault, summary, working, planned: local }
+      // The planner detected renames against its own copy of the baseline. Mirror the remap here as
+      // well: a renamed folder's children are only rewritten in `working` by this loop, and a
+      // round that ends in the error path writes `working` back to disk.
+      for (const { from, to } of result.renamed) {
+        const entry = working[from]
+        if (!entry) continue
+        delete working[from]
+        working[to] = { ...entry, path: to }
+      }
       const actions = this.filterSkippedActions(result.actions, summary)
       this.options.log.info(
         `plan: ${actions.length} action(s), ${local.size} local, ${remote.size} remote, ${Object.keys(working).length} baseline`,
@@ -749,6 +770,7 @@ export class SyncEngine {
         version: entry.version,
         content_type: entry.content_type,
         updated_at: entry.updated_at,
+        file_id: entry.file_id,
       }
       if (mapped.kind === 'file' && mapped.size > maxBytes) {
         this.skippedPaths.add(path)
@@ -913,6 +935,29 @@ export class SyncEngine {
         context.summary.mkdirs += 1
         context.working[action.path] = collectionBaseline(action.path)
         return
+      case 'move-local': {
+        const moved = await this.moveLocal(action.from, action.to)
+        if (moved) {
+          context.summary.moves += 1
+          const base = context.working[action.from]
+          if (base) {
+            // Keep the ETag/version (a MOVE does not touch the YDoc) but record the stat the file
+            // has after the rename, so the baseline refresh does not read it as a mid-round edit.
+            context.working[action.to] = {
+              ...base,
+              path: action.to,
+              size: moved.size,
+              mtime: moved.mtime,
+            }
+          }
+          delete context.working[action.from]
+        } else {
+          // Keep the old entry (with its `file_id`) so the next round can still recognise the
+          // remote rename instead of seeing a delete plus a new unrelated file.
+          this.skippedPaths.add(action.from)
+        }
+        return
+      }
       case 'download':
         await this.download(action.path, action.remote, context)
         return
@@ -957,6 +1002,43 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * Move a local file to the path the remote renamed it to.
+   *
+   * The content is *not* downloaded again: the ETag of a renamed YDoc is unchanged, so the bytes
+   * on disk are already correct and only the path has to follow. `vault.rename` is used so
+   * Obsidian updates its own index, backlinks and open editors; the `rename` event it fires is
+   * suppressed because the engine already recorded the new path in `working`.
+   */
+  private async moveLocal(
+    from: string,
+    to: string,
+  ): Promise<{ size: number; mtime: number } | null> {
+    const source = this.options.app.vault.getAbstractFileByPath(from)
+    if (!source) {
+      // Nothing to move (a concurrent round or the user removed it); fall back to a plain
+      // reconcile so the remote copy is materialised at the new path.
+      this.options.log.warn(`cannot move ${from} -> ${to}: the local file is gone`)
+      this.scheduleSync('rename fallback', 400)
+      return null
+    }
+    this.suppress(from)
+    this.suppress(to)
+    try {
+      await this.ensureFolder(parentOf(to))
+      await this.options.app.vault.rename(source, to)
+    } catch (error) {
+      this.options.log.warn(
+        `local move ${from} -> ${to} failed (${describeError(error)}); retrying next round`,
+      )
+      return null
+    }
+    this.roundWrites.add(to)
+    this.options.log.info(`local move: ${from} -> ${to} (remote rename)`)
+    const stat = await this.localStat(to)
+    return stat ?? { size: 0, mtime: 0 }
+  }
+
   private async download(path: string, remote: RemoteEntry, context: ActionContext): Promise<void> {
     const result = await this.withAuth((client) => client.getFile(context.vault, path))
     if (!result.notModified && result.data) {
@@ -975,6 +1057,7 @@ export class SyncEngine {
       mtime: stat?.mtime ?? Date.now(),
       version: remote.version,
       content_type: remote.content_type,
+      file_id: remote.file_id,
     }
   }
 
@@ -1083,6 +1166,9 @@ export class SyncEngine {
   private async resolveUploadConflict(path: string, localData: ArrayBuffer, context: ActionContext): Promise<void> {
     const remote = await this.withAuth((client) => client.getFile(context.vault, path))
     if (!remote.data) throw new ConflictError(`${path}: remote content disappeared during conflict resolution`)
+    // `getFile` returns bytes and an ETag, not the manifest row: keep the file identity the
+    // baseline already knows so a later rename is still recognisable.
+    const fileId = context.working[path]?.file_id ?? this.options.getState().baseline[path]?.file_id
     if (await sameBytes(localData, remote.data)) {
       this.options.log.info(`${path} already matches the remote content; conflict cleared`)
       const stat = await this.localStat(path)
@@ -1094,6 +1180,7 @@ export class SyncEngine {
         mtime: stat?.mtime ?? Date.now(),
         version: 0,
         content_type: contentTypeFor(path),
+        file_id: fileId,
       }
       return
     }
@@ -1110,6 +1197,7 @@ export class SyncEngine {
       mtime: stat?.mtime ?? Date.now(),
       version: 0,
       content_type: contentTypeFor(path),
+      file_id: fileId,
     }
     context.summary.conflicts += 1
   }
@@ -1145,6 +1233,7 @@ export class SyncEngine {
           mtime: stat?.mtime ?? Date.now(),
           version: remote.version,
           content_type: remote.content_type,
+          file_id: remote.file_id,
         }
         return
       }
@@ -1162,6 +1251,7 @@ export class SyncEngine {
           mtime: stat?.mtime ?? Date.now(),
           version: remote.version,
           content_type: remote.content_type,
+          file_id: remote.file_id,
         }
       }
       context.summary.conflicts += 1
@@ -1449,6 +1539,9 @@ export class SyncEngine {
       return
     }
     if (!from || !to || from === to) return
+    // A rename the engine itself performed to follow a remote MOVE is not a user rename: it must
+    // not schedule another remote MOVE for a path the server has already moved.
+    if (this.isSuppressed(from) || this.isSuppressed(to)) return
     if (isExcluded(from, this.options.getSettings()) || isExcluded(to, this.options.getSettings())) {
       this.scheduleSync('local rename across exclude boundary', 500)
       return
@@ -1463,7 +1556,12 @@ export class SyncEngine {
     void this.tryRemoteMove(from, to, file instanceof TFolder)
   }
 
-  private async tryRemoteMove(from: string, to: string, isFolder: boolean): Promise<void> {
+  private async tryRemoteMove(
+    from: string,
+    to: string,
+    isFolder: boolean,
+    attempt = 1,
+  ): Promise<void> {
     const state = this.options.getState()
     const prefix = `${from}/`
     // Snapshot the entries the MOVE has to remap *before* any await: a round that is already
@@ -1502,16 +1600,53 @@ export class SyncEngine {
       await this.persist()
       this.options.log.info(`remote move: ${from} -> ${to}${isFolder ? ' (folder)' : ''}`)
     } catch (error) {
+      // The local tree already has the new path while the remote still has the old one. A plain
+      // reconcile would upload the new path and delete the old one: a different YDoc with a fresh
+      // file id, which every other client then sees as "deleted + created". Retry the MOVE first
+      // so the note keeps its identity; only a terminal rejection falls back to a reconcile.
       if (error instanceof SyncHttpError && (error.status === 409 || error.status === 404)) {
+        // 409: the destination already exists; 404: the source was never synced. Both are
+        // terminal for the MOVE, so let the normal reconcile handle them.
         this.options.log.warn(`remote move failed (${error.status}); falling back to a full reconcile`)
         this.scheduleSync('rename fallback', 500)
       } else {
-        this.options.log.error(`remote move failed: ${describeError(error)}`)
-        this.scheduleSync('rename retry', 3000)
+        this.options.log.error(`remote move failed: ${describeError(error)}; retrying the move`)
+        this.retryRemoteMove(from, to, isFolder, attempt + 1)
       }
     } finally {
       this.moveInFlight.delete(from)
     }
+  }
+
+  /**
+   * Retry a MOVE that failed for a transient reason (network, 5xx, token refresh).
+   *
+   * A bounded number of attempts keeps a genuinely broken rename from looping forever; after that
+   * the normal reconcile takes over and the two paths are treated as independent files.
+   */
+  private retryRemoteMove(from: string, to: string, isFolder: boolean, attempt = 1): void {
+    if (attempt > MAX_MOVE_RETRIES) {
+      this.options.log.warn(
+        `giving up on remote move ${from} -> ${to} after ${MAX_MOVE_RETRIES} attempts; reconciling`,
+      )
+      this.scheduleSync('rename fallback', 500)
+      return
+    }
+    if (this.moveRetryTimer !== null) return
+    const delay = Math.min(30_000, 2000 * attempt)
+    this.moveRetryTimer = window.setTimeout(() => {
+      this.moveRetryTimer = null
+      if (!this.running || this.stopped) return
+      // The baseline may have been remapped by an intervening round; only retry while the source
+      // entry still exists under its old path.
+      const state = this.options.getState()
+      const prefix = `${from}/`
+      const stillTracked = Object.keys(state.baseline).some(
+        (path) => path === from || path.startsWith(prefix),
+      )
+      if (!stillTracked) return
+      void this.tryRemoteMove(from, to, isFolder, attempt + 1)
+    }, delay)
   }
 
   // -----------------------------------------------------------------------------------------
@@ -1665,6 +1800,11 @@ export class SyncEngine {
 // helpers
 // ---------------------------------------------------------------------------------------------
 
+function parentOf(path: string): string {
+  const index = path.lastIndexOf('/')
+  return index === -1 ? '' : path.slice(0, index)
+}
+
 function collectionBaseline(path: string): BaselineEntry {
   return {
     path,
@@ -1691,6 +1831,7 @@ function emptySummary(reason: string, message: string): SyncSummary {
     deletesLocal: 0,
     deletesRemote: 0,
     mkdirs: 0,
+    moves: 0,
     conflicts: 0,
     skipped: 0,
     errors: 0,
@@ -1713,6 +1854,8 @@ function describeAction(action: PlanAction): string {
       return `mkdir local ${action.path}`
     case 'mkdir-remote':
       return `mkdir remote ${action.path}`
+    case 'move-local':
+      return `move local ${action.from} -> ${action.to}`
     case 'conflict':
       return `conflict ${action.path} (${action.conflict})`
     case 'forget-baseline':

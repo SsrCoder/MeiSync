@@ -145,13 +145,24 @@ baseline so the next round retries instead of silently marking them synced.
 
 ### Renames and deletes
 
-* Local rename events call `POST /api/sync/move` immediately and remap the baseline prefix. If the
-  remote side rejects the move (destination exists, or the path was never synced), the plugin
-  falls back to a full reconciliation.
+* Local rename events call `POST /api/sync/move` immediately and remap the baseline prefix. A MOVE
+  that fails for a transient reason (network, 5xx) is retried with backoff, because falling back to
+  a reconcile would upload the new path and delete the old one — a new YDoc with a fresh `file_id`,
+  which every other client then sees as "deleted + created". Only a terminal rejection (destination
+  exists, or the path was never synced) falls back to a full reconciliation.
 * Local delete + unchanged remote → delete on the remote.
 * Remote delete + unchanged local → move the local file to the system trash (not a hard delete).
-* Remote rename appears as delete + create in the manifest; the next round downloads the new path
-  and removes the old one.
+* **Remote rename is detected by `file_id`, not by guessing from paths.** A MOVE only changes
+  `parent_id`/`name` on the server, so the manifest keeps reporting the same `file_id` and ETag
+  under the new path. The baseline stores that id; when the old path disappears and the id
+  reappears elsewhere, the planner emits a single `move-local` instead of treating the rename as a
+  delete plus an unrelated create. Without this, a client that was closed during the rename saw
+  "remote deleted `a.md`" plus "new remote file `b.md`" and — whenever its local `a.md` had drifted
+  — kept a conflict copy next to the renamed note: one note, two files.
+* A renamed folder is moved once; its children only have their baseline/local paths remapped, since
+  `vault.rename` on the folder already carries every file inside it.
+* If the local copy of a remotely renamed path is already gone, the rename degrades to the plain
+  remote-create path (download at the new path, forget the stale baseline row).
 
 ### File-level realtime feed
 

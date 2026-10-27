@@ -51,6 +51,13 @@ export interface BaselineEntry {
   mtime: number
   version: number
   content_type: string
+  /**
+   * Stable server-side file id (the manifest's `file_id`).
+   *
+   * It survives a MOVE, which is the only way to tell "the remote renamed this note" apart from
+   * "the remote deleted this note and created a different one somewhere else".
+   */
+  file_id?: string
 }
 
 export interface PersistedState {
@@ -74,6 +81,8 @@ export interface RemoteEntry {
   version: number
   content_type: string
   updated_at: string
+  /** Server-side file id, stable across renames. */
+  file_id?: string
 }
 
 export interface RemoteManifest {

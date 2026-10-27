@@ -165,6 +165,26 @@ async fn upload_manifest_conflict_move_delete_and_devices() {
     }
 
     // Move/rename keeps the same content but changes the manifest path.
+    let before: serde_json::Value = serde_json::from_str(
+        &body_string(
+            harness
+                .send(harness.request(
+                    "GET",
+                    "/api/sync/manifest?vault=obsidian%2FMyVault",
+                    Some(&token),
+                ))
+                .await,
+        )
+        .await,
+    )
+    .unwrap();
+    let before_entry = before["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "notes/hello.md")
+        .expect("uploaded file is in the manifest")
+        .clone();
     let response = harness
         .send(
             harness.request_with_body(
@@ -197,6 +217,17 @@ async fn upload_manifest_conflict_move_delete_and_devices() {
     assert!(!entries
         .iter()
         .any(|entry| entry["path"] == "notes/hello.md"));
+
+    // A MOVE only changes `parent_id`/`name`, so the file keeps its `file_id` *and* its ETag.
+    // Sync clients rely on that: it is the only way to tell "the remote renamed this note" apart
+    // from "the remote deleted it and created an unrelated one", and without it a rename turns
+    // into a duplicate note on a client whose local copy had drifted.
+    let after_entry = entries
+        .iter()
+        .find(|entry| entry["path"] == "notes/renamed.md")
+        .expect("renamed file is in the manifest");
+    assert_eq!(after_entry["file_id"], before_entry["file_id"]);
+    assert_eq!(after_entry["etag"], before_entry["etag"]);
 
     // Device registration is visible through the API.
     let response = harness

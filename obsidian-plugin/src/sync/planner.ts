@@ -34,6 +34,11 @@ export type PlanAction =
     }
   | { type: 'mkdir-local'; path: string }
   | { type: 'mkdir-remote'; path: string }
+  /**
+   * The remote renamed a file: move the local copy to its new path instead of deleting the old
+   * one and downloading the new one (which is what a rename looks like without file identity).
+   */
+  | { type: 'move-local'; path: string; from: string; to: string; local: LocalEntry; reason: string }
   | {
       type: 'conflict'
       path: string
@@ -56,6 +61,14 @@ export interface PlanResult {
   actions: PlanAction[]
   /** Paths whose local and remote state disagree but which need no action beyond a baseline update. */
   unchanged: string[]
+  /**
+   * Paths the planner remapped because the server renamed the file behind them.
+   *
+   * The engine applies these to its own working baseline so the two agree about where a file
+   * lives: without it a renamed *folder* would keep its children at the old paths there, and a
+   * round that ended in the error path would write those stale paths back to disk.
+   */
+  renamed: Array<{ from: string; to: string }>
 }
 
 /**
@@ -66,14 +79,20 @@ export interface PlanResult {
  * and keeps the engine responsible for ordering, retries and baseline bookkeeping.
  */
 export function plan(input: PlanInput): PlanResult {
-  const { baseline, local, remote } = input
+  const actions: PlanAction[] = []
+  const unchanged: string[] = []
+
+  // Renames first. A MOVE only changes `parent_id`/`name` on the server, so without this pass a
+  // renamed note looks like "the old path was deleted, a new file appeared somewhere else" and the
+  // local copy at the old path is either deleted outright or — when it has unsynced local edits —
+  // turned into a conflict copy that survives next to the renamed note. One note, two files.
+  const renamed = applyRemoteRenames(input, actions)
+  const { baseline, local, remote } = renamed
   const paths = new Set<string>([
     ...Object.keys(baseline),
     ...local.keys(),
     ...remote.keys(),
   ])
-  const actions: PlanAction[] = []
-  const unchanged: string[] = []
 
   for (const path of [...paths].sort()) {
     const base = baseline[path]
@@ -165,7 +184,100 @@ export function plan(input: PlanInput): PlanResult {
   }
 
   actions.sort(compareActions)
-  return { actions, unchanged }
+  return { actions, unchanged, renamed: renamed.remapped }
+}
+
+/**
+ * Rewrite "the remote deleted X and created Y" into "the remote renamed X to Y".
+ *
+ * The server never creates a new file for a rename: `move_file` only changes `parent_id`/`name`,
+ * so the manifest keeps reporting the same `file_id` (and the same ETag) under the new path. That
+ * identity is the only signal available, because the manifest is a flat path list with no
+ * tombstones. Without it, a client that missed the MOVE sees the old path vanish and an unrelated
+ * new file appear, which turns into a duplicate note as soon as the local copy has unsynced edits:
+ * the conflict path keeps the local file *and* downloads the renamed one next to it.
+ *
+ * The baseline entry is remapped but keeps its old `size`/`mtime`/`etag`, so local drift is still
+ * detected at the new path — the following planner pass decides whether the moved file has to be
+ * uploaded. Only paths that exist locally are remapped: when the local copy is already gone the
+ * normal delete/create handling is both correct and less destructive.
+ */
+function applyRemoteRenames(
+  input: PlanInput,
+  actions: PlanAction[],
+): {
+  baseline: Record<string, BaselineEntry>
+  local: Map<string, LocalEntry>
+  remote: Map<string, RemoteEntry>
+  /** `from` -> `to` for every path this pass rewrote. */
+  remapped: Array<{ from: string; to: string }>
+} {
+  const baseline: Record<string, BaselineEntry> = Object.assign(
+    Object.create(null) as Record<string, BaselineEntry>,
+    input.baseline,
+  )
+  const local = new Map(input.local)
+  const remote = new Map(input.remote)
+  /** Old-path prefixes already carried by a folder move; their children need no own action. */
+  const coveredPrefixes: string[] = []
+  const remapped: Array<{ from: string; to: string }> = []
+
+  const remoteByFileId = new Map<string, RemoteEntry>()
+  for (const entry of input.remote.values()) {
+    if (entry.file_id) remoteByFileId.set(entry.file_id, entry)
+  }
+  if (!remoteByFileId.size) return { baseline, local, remote, remapped }
+
+  for (const [from, base] of entriesByDepth(input.baseline)) {
+    if (!base.file_id) continue
+    const stillThere = input.remote.get(from)
+    if (stillThere && stillThere.file_id === base.file_id) continue
+    const target = remoteByFileId.get(base.file_id)
+    if (!target || target.path === from) continue
+    const to = target.path
+    // The destination is already a different tracked file (or a different kind): the server reused
+    // the path, so guessing an identity here would merge two notes. Leave it to the conflict rules.
+    const occupied = input.baseline[to]
+    if (occupied && occupied.file_id && occupied.file_id !== base.file_id) continue
+    const localFrom = input.local.get(from)
+    if (!localFrom) continue
+    if (input.local.has(to)) continue
+
+    delete baseline[from]
+    baseline[to] = { ...base, path: to, file_id: target.file_id }
+    local.delete(from)
+    local.set(to, { ...localFrom, path: to })
+    remapped.push({ from, to })
+    // The old path is gone from the server. Drop the stale manifest row as well, otherwise the
+    // main loop would still see "remote file without a baseline" at `from` and download it back.
+    remote.delete(from)
+
+    // A renamed folder is moved once, by its own action: renaming it already carries every child,
+    // so the children only need their baseline/local paths remapped (which happens above, because
+    // each child carries its own `file_id`). Emitting a move per child would fail, as the source
+    // path is already gone by then.
+    if (coveredPrefixes.some((prefix) => from.startsWith(prefix))) continue
+    if (localFrom.kind === 'collection') coveredPrefixes.push(`${from}/`)
+    actions.push({
+      type: 'move-local',
+      path: to,
+      from,
+      to,
+      local: localFrom,
+      reason: 'remote rename',
+    })
+  }
+
+  return { baseline, local, remote, remapped }
+}
+
+/** Shallowest first, so a renamed folder is seen before its children. */
+function entriesByDepth(
+  baseline: Record<string, BaselineEntry>,
+): Array<[string, BaselineEntry]> {
+  return Object.entries(baseline).sort(
+    (a, b) => a[0].split('/').length - b[0].split('/').length || a[0].localeCompare(b[0]),
+  )
 }
 
 function planWithoutBaseline(
@@ -343,14 +455,18 @@ function priority(action: PlanAction): number {
     // that the local file currently occupies.
     case 'conflict':
       return 1
+    // Renames run before any download into the destination path, and after the folder creation
+    // the remapped baseline may have triggered for a renamed parent.
+    case 'move-local':
+      return 2
     case 'download':
     case 'upload':
-      return 2
+      return 3
     case 'delete-local':
     case 'delete-remote':
-      return 3
-    default:
       return 4
+    default:
+      return 5
   }
 }
 
@@ -363,7 +479,7 @@ function compareActions(a: PlanAction, b: PlanAction): number {
     // Children before parents: deleting a folder must happen after its files.
     return bPath.split('/').length - aPath.split('/').length || aPath.localeCompare(bPath)
   }
-  if (a.type === 'mkdir-local' || a.type === 'mkdir-remote') {
+  if (a.type === 'mkdir-local' || a.type === 'mkdir-remote' || a.type === 'move-local') {
     // Parents before children.
     return aPath.split('/').length - bPath.split('/').length || aPath.localeCompare(bPath)
   }
@@ -387,6 +503,7 @@ export function baselineFrom(
         mtime: 0,
         version: remoteEntry.version,
         content_type: '',
+        file_id: remoteEntry.file_id,
       }
       continue
     }
@@ -398,6 +515,7 @@ export function baselineFrom(
       mtime: localEntry.mtime,
       version: remoteEntry.version,
       content_type: remoteEntry.content_type,
+      file_id: remoteEntry.file_id,
     }
   }
   return baseline
