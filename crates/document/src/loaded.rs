@@ -206,6 +206,22 @@ impl DocumentHandle {
             }
         }
         let text = encode_content(guard.encoding, &content);
+        // An identical PUT is not a write. `replace_content` deletes and reinserts
+        // the whole text, so even a byte-identical body would produce fresh ops:
+        // every subscriber would receive a "new" document whose content did not
+        // change, a reconnecting client would pull those ops as a full state
+        // resend, and two clients syncing the same file through the API would
+        // feed each other's channels forever. Skip the mutation instead.
+        if guard.content() == text {
+            tracing::info!(file_id = %self.file_id, bytes = content.len(), "identical PUT ignored; content already current");
+            return Ok(DocumentSnapshot {
+                size: guard.size,
+                content: decode_content(guard.encoding, &guard.content()),
+                etag: guard.etag.clone(),
+                version: guard.version,
+                sync_mode: guard.sync_mode,
+            });
+        }
         let update = replace_content(&guard.doc, &origin, &text);
         let mut snapshot = finish_mutation(
             &mut guard,

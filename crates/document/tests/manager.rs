@@ -254,6 +254,51 @@ async fn remote_updates_broadcast_to_the_room() {
     f.manager.unsubscribe(&f.meta.id, conn).await;
 }
 
+/// A PUT whose body equals the current content must be a no-op.
+///
+/// `replace_content` deletes and reinserts the whole text, so an identical
+/// body would still mint fresh ops: every subscriber would receive a "new"
+/// document whose content did not change, a reconnecting client would pull
+/// that as a full state resend, and two clients syncing through the file API
+/// would feed each other's channels forever.
+#[tokio::test]
+async fn an_identical_put_is_ignored() {
+    let f = fixture().await;
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    let (conn, mut events) = f.manager.subscribe(&f.meta.id).await;
+
+    let first = handle
+        .replace_content(&UserId::new("alice"), b"same bytes".to_vec(), None)
+        .await
+        .expect("first write");
+    match events.recv().await.expect("event") {
+        RoomEvent::Update(bytes) => assert!(!Update::decode_v1(&bytes).expect("update").is_empty()),
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // The same body again: no broadcast, no new revision, same etag.
+    let second = handle
+        .replace_content(&UserId::new("alice"), b"same bytes".to_vec(), None)
+        .await
+        .expect("second write");
+    assert!(events.try_recv().is_err(), "an identical PUT must not broadcast");
+    assert_eq!(second.etag, first.etag, "the etag must not move");
+    assert_eq!(second.version, first.version, "and neither the version");
+
+    // A different body still writes and broadcasts.
+    let third = handle
+        .replace_content(&UserId::new("alice"), b"different".to_vec(), None)
+        .await
+        .expect("third write");
+    assert_ne!(third.etag, first.etag);
+    match events.recv().await.expect("event") {
+        RoomEvent::Update(bytes) => assert!(!Update::decode_v1(&bytes).expect("update").is_empty()),
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    f.manager.unsubscribe(&f.meta.id, conn).await;
+}
+
 #[tokio::test]
 async fn diff_and_state_vector_are_incremental() {
     let f = fixture().await;
