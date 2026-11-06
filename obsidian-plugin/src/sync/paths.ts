@@ -79,6 +79,8 @@ const TEXT_EXTENSIONS = new Set([
   'env',
   'gitignore',
   'properties',
+  'jsonl',
+  'ndjson',
 ])
 
 const MIME: Record<string, string> = {
@@ -90,6 +92,8 @@ const MIME: Record<string, string> = {
   txt: 'text/plain',
   json: 'application/json',
   jsonc: 'application/json',
+  jsonl: 'application/x-ndjson',
+  ndjson: 'application/x-ndjson',
   yaml: 'application/yaml',
   yml: 'application/yaml',
   toml: 'application/toml',

@@ -12,9 +12,7 @@ pub const CONTENT_KEY: &str = "content";
 
 macro_rules! string_id {
     ($name:ident) => {
-        #[derive(
-            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-        )]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -36,9 +34,10 @@ macro_rules! string_id {
             pub fn is_valid_fs_name(&self) -> bool {
                 !self.0.is_empty()
                     && self.0.len() <= 128
-                    && self.0.chars().all(|c| {
-                        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-                    })
+                    && self
+                        .0
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
                     && self.0 != "."
                     && self.0 != ".."
             }
@@ -106,7 +105,6 @@ impl Visibility {
     }
 }
 
-
 /// Collections (directories) and files are both FileDocuments; a collection simply has no
 /// meaningful content type / size and can not be synchronized as a blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,7 +137,6 @@ impl FileKind {
         }
     }
 }
-
 
 /// Which YDoc synchronisation strategy a document uses (`docs/mvp.md` §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -175,7 +172,6 @@ impl SyncMode {
     }
 }
 
-
 /// How the bytes of a file are represented inside the single `Y.Text("content")` root.
 ///
 /// The MVP content model is text only (`docs/mvp.md` §6), but the same tree must also carry the
@@ -202,17 +198,31 @@ impl ContentEncoding {
 /// (`docs/mvp.md` §5.1).
 pub fn content_encoding(content_type: Option<&str>) -> ContentEncoding {
     let ct = match content_type {
-        Some(ct) => ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase(),
+        Some(ct) => ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase(),
         None => return ContentEncoding::Base64,
     };
     if ct.starts_with("text/") {
         return ContentEncoding::Text;
     }
     match ct.as_str() {
-        "application/json" | "application/x-ndjson" | "application/yaml" | "application/x-yaml"
-        | "application/toml" | "application/xml" | "application/javascript"
-        | "application/ecmascript" | "application/typescript" | "application/x-sh"
-        | "application/csv" | "application/x-sql" | "application/graphql" => ContentEncoding::Text,
+        "application/json"
+        | "application/x-ndjson"
+        | "application/yaml"
+        | "application/x-yaml"
+        | "application/toml"
+        | "application/xml"
+        | "application/javascript"
+        | "application/ecmascript"
+        | "application/typescript"
+        | "application/x-sh"
+        | "application/csv"
+        | "application/x-sql"
+        | "application/graphql" => ContentEncoding::Text,
         // Everything else (binary, images, archives, unknown types) is full state sync (§5.2).
         _ => ContentEncoding::Base64,
     }
@@ -251,7 +261,13 @@ pub const GENERIC_CONTENT_TYPES: &[&str] = &[
 /// up in `files.content_type`, so `GET /dav` and S3 responses report the resolved type.
 pub fn resolve_content_type(content_type: Option<&str>, name: &str) -> String {
     let declared = content_type
-        .map(|ct| ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
         .filter(|ct| !ct.is_empty());
     match declared {
         Some(ct) if !GENERIC_CONTENT_TYPES.contains(&ct.as_str()) => ct,
@@ -470,6 +486,8 @@ pub fn guess_content_type(name: &str) -> String {
         "txt" | "log" | "text" => "text/plain",
         "md" | "markdown" => "text/markdown",
         "json" => "application/json",
+        // NDJSON (one JSON object per line) is plain text and gets incremental CRDT sync.
+        "jsonl" | "ndjson" => "application/x-ndjson",
         "yaml" | "yml" => "application/yaml",
         "toml" => "application/toml",
         "xml" => "application/xml",
@@ -498,16 +516,24 @@ pub fn guess_content_type(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_content_type, ContentEncoding, SyncMode, content_encoding, guess_sync_mode};
+    use super::{
+        content_encoding, guess_sync_mode, resolve_content_type, ContentEncoding, SyncMode,
+    };
 
     #[test]
     fn a_specific_declared_type_wins() {
-        assert_eq!(resolve_content_type(Some("text/markdown"), "notes.md"), "text/markdown");
+        assert_eq!(
+            resolve_content_type(Some("text/markdown"), "notes.md"),
+            "text/markdown"
+        );
         assert_eq!(
             resolve_content_type(Some("text/markdown; charset=utf-8"), "notes.md"),
             "text/markdown"
         );
-        assert_eq!(resolve_content_type(Some("image/png"), "notes.md"), "image/png");
+        assert_eq!(
+            resolve_content_type(Some("image/png"), "notes.md"),
+            "image/png"
+        );
         assert_eq!(
             resolve_content_type(Some("  Application/JSON  "), "blob.bin"),
             "application/json"
@@ -517,20 +543,41 @@ mod tests {
     #[test]
     fn a_generic_type_defers_to_the_extension() {
         // The Apifox / curl / S3 SDK case: `application/octet-stream` on a markdown file.
-        assert_eq!(resolve_content_type(Some("application/octet-stream"), "图床.md"), "text/markdown");
+        assert_eq!(
+            resolve_content_type(Some("application/octet-stream"), "图床.md"),
+            "text/markdown"
+        );
         assert_eq!(
             resolve_content_type(Some("application/octet-stream"), "logo.png"),
             "image/png"
         );
-        assert_eq!(resolve_content_type(Some("binary/octet-stream"), "a.json"), "application/json");
+        assert_eq!(
+            resolve_content_type(Some("binary/octet-stream"), "a.json"),
+            "application/json"
+        );
+        // JSONL uploads (common client default: octet-stream) must stay text, not base64.
+        assert_eq!(
+            resolve_content_type(Some("application/octet-stream"), "a.jsonl"),
+            "application/x-ndjson"
+        );
+        assert_eq!(
+            resolve_content_type(None, "export.ndjson"),
+            "application/x-ndjson"
+        );
         // curl's default for --data-binary is form encoding, which says nothing about the file.
         assert_eq!(
             resolve_content_type(Some("application/x-www-form-urlencoded"), "notes.md"),
             "text/markdown"
         );
         // Nothing to go by: stay binary rather than corrupt the bytes.
-        assert_eq!(resolve_content_type(Some("application/octet-stream"), "blob"), "application/octet-stream");
-        assert_eq!(resolve_content_type(Some("application/octet-stream"), "blob.bin"), "application/octet-stream");
+        assert_eq!(
+            resolve_content_type(Some("application/octet-stream"), "blob"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resolve_content_type(Some("application/octet-stream"), "blob.bin"),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -538,17 +585,40 @@ mod tests {
         assert_eq!(resolve_content_type(None, "notes.md"), "text/markdown");
         assert_eq!(resolve_content_type(None, "logo.png"), "image/png");
         assert_eq!(resolve_content_type(Some(""), "notes.md"), "text/markdown");
-        assert_eq!(resolve_content_type(Some("  "), "notes.md"), "text/markdown");
+        assert_eq!(
+            resolve_content_type(Some("  "), "notes.md"),
+            "text/markdown"
+        );
     }
 
     #[test]
     fn resolution_drives_the_storage_encoding() {
-        let octet_stream_markdown = resolve_content_type(Some("application/octet-stream"), "notes.md");
-        assert_eq!(content_encoding(Some(&octet_stream_markdown)), ContentEncoding::Text);
-        assert_eq!(guess_sync_mode(Some(&octet_stream_markdown)), SyncMode::Incremental);
+        let octet_stream_markdown =
+            resolve_content_type(Some("application/octet-stream"), "notes.md");
+        assert_eq!(
+            content_encoding(Some(&octet_stream_markdown)),
+            ContentEncoding::Text
+        );
+        assert_eq!(
+            guess_sync_mode(Some(&octet_stream_markdown)),
+            SyncMode::Incremental
+        );
 
         let octet_stream_png = resolve_content_type(Some("application/octet-stream"), "logo.png");
-        assert_eq!(content_encoding(Some(&octet_stream_png)), ContentEncoding::Base64);
+        assert_eq!(
+            content_encoding(Some(&octet_stream_png)),
+            ContentEncoding::Base64
+        );
         assert_eq!(guess_sync_mode(Some(&octet_stream_png)), SyncMode::Full);
+
+        let octet_stream_jsonl = resolve_content_type(Some("application/octet-stream"), "a.jsonl");
+        assert_eq!(
+            content_encoding(Some(&octet_stream_jsonl)),
+            ContentEncoding::Text
+        );
+        assert_eq!(
+            guess_sync_mode(Some(&octet_stream_jsonl)),
+            SyncMode::Incremental
+        );
     }
 }
