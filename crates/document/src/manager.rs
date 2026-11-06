@@ -6,7 +6,7 @@ use meisync_core::{FileId, FileMetadata, Result, SyncMode};
 use meisync_persistence::fs_store::{CompactionPolicy, DocumentStore};
 use meisync_persistence::{FileRepository, YDocRepository};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::loaded::{restore_document, DocumentHandle};
 use crate::room::{ConnId, Room, RoomEvent};
@@ -311,7 +311,7 @@ impl DocumentManager {
         let mut evicted = 0;
         for (file_id, handle) in candidates {
             if handle.is_idle_for(self.config.idle_unload_after).await {
-                debug!(file_id = %file_id, "unloading idle ydoc");
+                info!(file_id = %file_id, "unloading idle ydoc");
                 self.evict(&file_id).await;
                 evicted += 1;
             }
