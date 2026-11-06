@@ -1,8 +1,16 @@
-/* MeiSync admin console – dependency-free SPA. */
+/* MeiSync admin console – dependency-free SPA.
+ *
+ * The realtime file editor additionally lazy-loads the prebuilt vendor bundle at
+ * `/admin/vendor/bundle.js` (Yjs + CodeMirror 6, see `web/scripts/build-admin-vendor.mjs`);
+ * every other view works without it. */
 
 const API = '/api/admin'
 const TOKEN_KEY = 'meisync.admin.token'
 const FILE_PATH_KEY = 'meisync.admin.filePath'
+/** Text files at or below this size open in the live editor; larger ones fall back to a static preview. */
+const EDIT_LIMIT = 2 * 1024 * 1024
+/** Awareness cursor colours, picked deterministically from the clientID. */
+const PEER_COLORS = ['#f97316', '#22d3ee', '#a78bfa', '#4ade80', '#f472b6', '#facc15', '#38bdf8', '#fb7185']
 const app = document.getElementById('app')
 
 const ROUTES = {
@@ -126,6 +134,7 @@ function icon(name, size = 16) {
     trash: '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
     edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     check: '<path d="m20 6-11 11-5-5"/>',
     shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
@@ -802,7 +811,7 @@ async function viewFiles(view) {
             <td class="muted" style="white-space:nowrap">${esc(fmtRelative(file.updated_at))}</td>
             <td>
               <div class="row-actions">
-                ${file.kind === 'file' ? `<button class="btn small ghost" data-preview="${esc(file.path)}">${icon('eye', 13)} View</button>` : `<button class="btn small ghost" data-open="${esc(file.path)}" data-kind="collection">${icon('folder', 13)} Open</button>`}
+                ${file.kind === 'file' ? `<button class="btn small ghost" data-preview="${esc(file.path)}">${icon('edit', 13)} Edit</button>` : `<button class="btn small ghost" data-open="${esc(file.path)}" data-kind="collection">${icon('folder', 13)} Open</button>`}
                 <button class="btn small danger" data-remove="${esc(file.path)}" data-name="${esc(file.name)}" data-kind="${esc(file.kind)}">${icon('trash', 13)}</button>
               </div>
             </td>
@@ -811,10 +820,11 @@ async function viewFiles(view) {
         .join('')
     : `<tr><td colspan="7">${emptyState('This collection is empty', 'Upload files through WebDAV, S3, the sync API or the Obsidian plugin.', 'folder')}</td></tr>`
 
+  // pi-lens-ignore: ast-grep:no-inner-html-js
   view.innerHTML = `
     ${pageHead(
       'Files',
-      'Every protocol writes into the same namespace; this is a read-only browser with administrative delete.',
+      'Every protocol writes into the same namespace; open a text file to view and edit it live through Yjs.',
       `<button class="btn" id="files-up">${icon('upload', 14)} Up</button><button class="btn" id="files-refresh">${icon('refresh')} Refresh</button>`,
     )}
     <div class="card">
@@ -857,14 +867,14 @@ async function viewFiles(view) {
     button.addEventListener('click', () => {
       const path = button.dataset.open
       if (button.dataset.kind === 'collection') setPath(path)
-      else openPreview(path, button.textContent.trim(), '')
+      else openEditor(path, button.textContent.trim(), '')
     })
   })
   view.querySelectorAll('[data-preview]').forEach((button) => {
     button.addEventListener('click', () => {
       const path = button.dataset.preview
       const file = data.files.find((item) => item.path === path)
-      openPreview(path, file?.name || path.split('/').pop(), file?.content_type || '')
+      openEditor(path, file?.name || path.split('/').pop(), file?.content_type || '')
     })
   })
   view.querySelectorAll('[data-remove]').forEach((button) => {
@@ -916,41 +926,466 @@ function breadcrumb(path) {
   return items.join('')
 }
 
-async function openPreview(path, name, contentType) {
-  const bodyId = `preview-${Date.now()}`
+// ---------------------------------------------------------------------------
+// file editor (CodeMirror 6 + Yjs realtime over YSync)
+// ---------------------------------------------------------------------------
+
+/**
+ * Open a file in the editor modal.
+ *
+ * Text files up to `EDIT_LIMIT` connect to the file's YDoc over YSync and edit it live
+ * (sharing the same document as the web test client and the Obsidian plugin); the permission
+ * service decides access, so a file the admin account cannot sync degrades to a static
+ * read-only preview. Oversized and binary files also fall back to the static view.
+ */
+async function openEditor(path, name, contentType) {
+  const bodyId = `editor-${Date.now()}`
   let objectUrl = null
+  let live = null
+  const teardownLive = () => {
+    if (!live) return
+    const { provider, view, ydoc } = live
+    live = null
+    try { provider.destroy() } catch { /* already gone */ }
+    try { view.destroy() } catch { /* already gone */ }
+    ydoc.destroy()
+  }
   const { overlay } = openModal({
     title: name || path,
     wide: true,
-    body: `<div id="${bodyId}" class="empty"><div class="empty-icon">${icon('refresh')}</div><strong>Loading preview…</strong><span class="muted-2">${esc(path)}</span></div>`,
-    footer: `<a class="btn ghost" data-download href="#" download="${esc(name || 'file')}">${icon('download')} Download</a><button type="button" class="btn" data-close>Close</button>`,
+    body: `<div id="${bodyId}" class="empty"><div class="empty-icon">${icon('refresh')}</div><strong>Loading file…</strong><span class="muted-2">${esc(path)}</span></div>`,
+    footer: `<span class="chip editor-status" id="${bodyId}-status" hidden></span><a class="btn ghost" data-download href="#" download="${esc(name || 'file')}">${icon('download')} Download</a><button type="button" class="btn" data-close>Close</button>`,
     onClose: () => {
+      teardownLive()
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     },
   })
-  const target = overlay.querySelector(`#${bodyId}`)
+  const bodyEl = overlay.querySelector('.modal-body')
+  const statusChip = overlay.querySelector(`#${bodyId}-status`)
+  const setStatus = (text, kind = '') => {
+    statusChip.hidden = !text
+    statusChip.textContent = text
+    statusChip.className = `chip editor-status ${kind}`
+  }
+  const setBody = (html) => {
+    // pi-lens-ignore: ast-grep:no-inner-html-js
+    bodyEl.innerHTML = html
+  }
+  const renderStatic = (text, notes = []) => {
+    setStatus('')
+    setBody(
+      `<pre class="preview">${esc(text)}</pre><div class="chip-row" style="margin-top:12px">${notes
+        .map((note) => `<span class="chip">${esc(note)}</span>`)
+        .join('')}</div>`,
+    )
+  }
+
   try {
     const response = await api(`/file?path=${encodeURIComponent(path)}`, { raw: true })
+    if (!overlay.isConnected) return
     const blob = await response.blob()
     const type = response.headers.get('content-type') || contentType || blob.type || ''
     const download = overlay.querySelector('[data-download]')
     objectUrl = URL.createObjectURL(blob)
-    if (!overlay.isConnected) {
-      URL.revokeObjectURL(objectUrl)
-      objectUrl = null
+    download.href = objectUrl
+
+    if (!isTextual(type, name)) {
+      setBody(
+        `<div class="empty"><div class="empty-icon">${icon('file')}</div><strong>Binary file</strong><span class="muted-2">${esc(type || 'application/octet-stream')} · ${esc(fmtBytes(blob.size))}</span><p class="muted">Use Download to inspect it locally.</p></div>`,
+      )
       return
     }
-    download.href = objectUrl
-    if (isTextual(type, name)) {
-      const text = await blob.text()
-      const truncated = text.length > 400_000
-      target.outerHTML = `<pre class="preview">${esc(truncated ? `${text.slice(0, 400_000)}\n\n… preview truncated at 400 KB` : text)}</pre>
-        <div class="chip-row" style="margin-top:12px"><span class="chip">${esc(type || 'text/plain')}</span><span class="chip">${esc(fmtBytes(blob.size))}</span></div>`
-    } else {
-      target.outerHTML = `<div class="empty"><div class="empty-icon">${icon('file')}</div><strong>Binary file</strong><span class="muted-2">${esc(type || 'application/octet-stream')} · ${esc(fmtBytes(blob.size))}</span><p class="muted">Use Download to inspect it locally.</p></div>`
+
+    let text = await blob.text()
+    if (!overlay.isConnected) return
+    if (blob.size > EDIT_LIMIT) {
+      text = `${text.slice(0, EDIT_LIMIT)}\n\n… preview truncated at ${fmtBytes(EDIT_LIMIT)}`
+      renderStatic(text, [type || 'text/plain', fmtBytes(blob.size), 'too large for live editing — read-only preview'])
+      return
     }
+
+    setStatus('Loading editor…')
+    // Ask before connecting: the WebSocket handshake hides the HTTP status, so a permission
+    // denial would otherwise look like a flaky connection and loop on retries forever.
+    const access = await ysyncAccess(path, state.token)
+    if (!overlay.isConnected) return
+    if (!access.ok) {
+      renderStatic(text, [type || 'text/plain', fmtBytes(blob.size), `no sync permission — read-only preview (${access.reason})`])
+      return
+    }
+    let vendor
+    try {
+      vendor = await import('/admin/vendor/bundle.js')
+    } catch {
+      renderStatic(text, [type || 'text/plain', fmtBytes(blob.size), 'editor bundle unavailable — read-only preview'])
+      return
+    }
+    if (!overlay.isConnected) return
+
+    // Shared document: same Y.Text("content") the YSync endpoint serves to every client.
+    const ydoc = new vendor.Y.Doc()
+    const ytext = ydoc.getText('content')
+    const awareness = new vendor.Awareness(ydoc)
+    awareness.setLocalStateField('user', {
+      name: state.me?.user?.username || 'admin',
+      color: PEER_COLORS[ydoc.clientID % PEER_COLORS.length],
+    })
+    const provider = new YsyncProvider(vendor, { url: ysyncWsUrl(path, state.token), doc: ydoc, awareness })
+
+    const updatePeers = () => {
+      if (!live) return
+      if (provider.status !== 'connected' || !provider.synced) return
+      const peers = [...awareness.getStates().keys()].filter((id) => id !== ydoc.clientID).length
+      setStatus(`Live · ${peers ? `${peers} peer${peers === 1 ? '' : 's'}` : 'only you'}`, 'live')
+    }
+    provider.on('status', (status) => {
+      if (!live) return
+      if (status === 'connecting') setStatus('Connecting to live session…', 'syncing')
+      else if (status === 'connected') setStatus('Syncing…', 'syncing')
+      else if (status === 'reconnecting') setStatus('Connection lost — reconnecting…', 'syncing')
+      else if (status === 'disconnected') setStatus('Offline — check the node connection', 'error')
+      updatePeers()
+    })
+    provider.on('synced', updatePeers)
+    awareness.on('update', updatePeers)
+    provider.on('denied', (reason) => {
+      // The server revoked access mid-session (e.g. the file was deleted); keep the fetched
+      // bytes as a read-only view instead of retrying.
+      teardownLive()
+      renderStatic(text, [type || 'text/plain', fmtBytes(blob.size), `live session ended — read-only preview (${reason})`])
+    })
+
+    setBody(`<div class="editor-root" id="${bodyId}-cm"></div>`)
+    const view = new vendor.EditorView({
+      state: vendor.EditorState.create({
+        extensions: editorExtensions(vendor, name, ytext, awareness),
+      }),
+      parent: overlay.querySelector(`#${bodyId}-cm`),
+    })
+    live = { provider, view, ydoc }
+    if (!overlay.isConnected) teardownLive()
   } catch (error) {
-    target.innerHTML = `<div class="alert">${esc(error.message)}</div>`
+    setStatus('')
+    setBody(`<div class="alert">${esc(error.message)}</div>`)
+  }
+}
+
+/** CodeMirror 6 setup: dark theme, one language package per file type, Yjs binding. */
+function editorExtensions(vendor, name, ytext, awareness) {
+  const ext = String(name || '').split('.').pop().toLowerCase()
+  let language = []
+  switch (ext) {
+    case 'json':
+    case 'jsonl':
+    case 'canvas':
+      language = [vendor.json()]
+      break
+    case 'md':
+    case 'markdown':
+      language = [vendor.markdown()]
+      break
+    case 'mjs':
+    case 'cjs':
+      language = [vendor.javascript()]
+      break
+    case 'jsx':
+      language = [vendor.javascript({ jsx: true })]
+      break
+    case 'ts':
+      language = [vendor.javascript({ typescript: true })]
+      break
+    case 'tsx':
+      language = [vendor.javascript({ typescript: true, jsx: true })]
+      break
+    case 'css':
+      language = [vendor.css()]
+      break
+    case 'html':
+    case 'htm':
+      language = [vendor.html()]
+      break
+    case 'py':
+      language = [vendor.python()]
+      break
+    case 'rs':
+      language = [vendor.rust()]
+      break
+    case 'yml':
+    case 'yaml':
+      language = [vendor.yaml()]
+      break
+    case 'toml':
+      language = [vendor.StreamLanguage.define(vendor.toml)]
+      break
+    case 'go':
+      language = [vendor.StreamLanguage.define(vendor.go)]
+      break
+    case 'sh':
+    case 'bash':
+    case 'zsh':
+      language = [vendor.StreamLanguage.define(vendor.shell)]
+      break
+    default:
+      language = []
+  }
+  return [
+    vendor.lineNumbers(),
+    vendor.highlightActiveLineGutter(),
+    vendor.highlightSpecialChars(),
+    vendor.drawSelection(),
+    vendor.dropCursor(),
+    vendor.EditorState.allowMultipleSelections.of(true),
+    vendor.indentOnInput(),
+    vendor.syntaxHighlighting(vendor.defaultHighlightStyle, { fallback: true }),
+    vendor.bracketMatching(),
+    vendor.closeBrackets(),
+    vendor.highlightActiveLine(),
+    vendor.highlightSelectionMatches(),
+    vendor.EditorView.lineWrapping,
+    vendor.keymap.of([
+      ...vendor.closeBracketsKeymap,
+      ...vendor.defaultKeymap,
+      ...vendor.searchKeymap,
+      ...vendor.yUndoManagerKeymap,
+      vendor.indentWithTab,
+    ]),
+    vendor.search({ top: true }),
+    vendor.oneDark,
+    ...language,
+    vendor.yCollab(ytext, awareness, { undoManager: new vendor.Y.UndoManager(ytext) }),
+  ]
+}
+
+/** Encoded namespace path for the YSync endpoints (`/ysync/<path>`). */
+function ysyncPathSuffix(path) {
+  const clean = String(path || '').replace(/^\/+/, '')
+  return `/${clean
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')}`
+}
+
+/**
+ * Probe the YSync authorization before opening the editor socket: a plain GET (no upgrade
+ * header) walks the same authenticate → authorize path and then answers 400. 403/404 mean this
+ * account has no sync permission on the file; anything else is treated as "connect and let the
+ * protocol take over".
+ */
+async function ysyncAccess(path, token) {
+  try {
+    const response = await fetch(`/ysync${ysyncPathSuffix(path)}`, {
+      headers: { Authorization: `Bearer ${token || ''}` },
+    })
+    if (response.status === 401) return { ok: false, reason: 'session expired' }
+    if (response.status === 403 || response.status === 404) {
+      let message = response.status === 404 ? 'file not visible to this account' : ''
+      try {
+        const body = await response.json()
+        message = body?.message || message
+      } catch {
+        /* body shape is best effort */
+      }
+      return { ok: false, reason: message || 'no sync permission' }
+    }
+    return { ok: true }
+  } catch {
+    // Network hiccup: let the WebSocket path surface connection problems instead.
+    return { ok: true }
+  }
+}
+
+/** Namespace path + token -> same-origin YSync WebSocket URL (CSP `connect-src 'self'` allows it). */
+function ysyncWsUrl(path, token) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}/ysync${ysyncPathSuffix(path)}?token=${encodeURIComponent(token || '')}`
+}
+
+/**
+ * Minimal YSync client for the editor — the same y-websocket compatible framing as the test
+ * client (`web/src/meisync/provider.ts`), reduced to what the modal needs: the sync handshake,
+ * live updates, awareness relay and the `auth denied` signal that triggers the static fallback.
+ * Reconnects with capped backoff while the modal is open; never after a denial.
+ */
+class YsyncProvider {
+  constructor(vendor, { url, doc, awareness }) {
+    this.vendor = vendor
+    this.doc = doc
+    this.awareness = awareness
+    this.url = url
+    this.status = 'disconnected'
+    this.synced = false
+    this.ws = null
+    this.shouldConnect = false
+    this.attempt = 0
+    this.timer = null
+    this.listeners = new Map()
+
+    // Everything the server sends is applied with `this` as the origin, so frames coming back
+    // over the socket are never re-sent (the handlers below skip their own origin).
+    this.handleDocUpdate = (update, origin) => {
+      if (origin === this) return
+      const encoder = vendor.encoding.createEncoder()
+      vendor.encoding.writeVarUint(encoder, 0) // MESSAGE_SYNC
+      vendor.syncProtocol.writeUpdate(encoder, update)
+      this.send(vendor.encoding.toUint8Array(encoder))
+    }
+    this.doc.on('update', this.handleDocUpdate)
+    this.handleAwarenessUpdate = (changes, origin) => {
+      if (origin === this) return
+      const clients = changes.added.concat(changes.updated, changes.removed)
+      this.sendAwareness(clients)
+    }
+    this.awareness.on('update', this.handleAwarenessUpdate)
+    this.connect()
+  }
+
+  on(event, callback) {
+    let set = this.listeners.get(event)
+    if (!set) {
+      set = new Set()
+      this.listeners.set(event, set)
+    }
+    set.add(callback)
+  }
+
+  emit(event, payload) {
+    this.listeners.get(event)?.forEach((callback) => callback(payload))
+  }
+
+  connect() {
+    if (this.ws || this.shouldConnect) return
+    this.shouldConnect = true
+    this.open()
+  }
+
+  disconnect() {
+    this.shouldConnect = false
+    this.clearReconnect()
+    this.closeSocket()
+    this.setSynced(false)
+    this.setStatus('disconnected')
+  }
+
+  destroy() {
+    this.disconnect()
+    this.vendor.removeAwarenessStates(this.awareness, [this.doc.clientID], 'destroy')
+    this.doc.off('update', this.handleDocUpdate)
+    this.awareness.off('update', this.handleAwarenessUpdate)
+    this.listeners.clear()
+  }
+
+  open() {
+    if (!this.shouldConnect) return
+    this.setStatus('connecting')
+    const ws = new WebSocket(this.url)
+    ws.binaryType = 'arraybuffer'
+    this.ws = ws
+    ws.onopen = () => {
+      if (this.ws !== ws) return
+      this.attempt = 0
+      this.setStatus('connected')
+      // Standard handshake: "what do I miss?" + awareness query + our own awareness state.
+      const encoder = this.vendor.encoding.createEncoder()
+      this.vendor.encoding.writeVarUint(encoder, 0) // MESSAGE_SYNC
+      this.vendor.syncProtocol.writeSyncStep1(encoder, this.doc)
+      this.vendor.encoding.writeVarUint(encoder, 3) // MESSAGE_QUERY_AWARENESS
+      this.send(this.vendor.encoding.toUint8Array(encoder))
+      if (this.awareness.getLocalState()) this.sendAwareness([this.doc.clientID])
+    }
+    ws.onmessage = (event) => {
+      if (this.ws === ws) this.handleMessage(new Uint8Array(event.data))
+    }
+    ws.onclose = () => {
+      if (this.ws !== ws) return
+      this.ws = null
+      this.setSynced(false)
+      if (!this.shouldConnect) {
+        this.setStatus('disconnected')
+        return
+      }
+      const delay = Math.min(500 * 2 ** this.attempt++, 8000)
+      this.setStatus('reconnecting')
+      this.timer = setTimeout(() => {
+        this.timer = null
+        this.open()
+      }, delay)
+    }
+  }
+
+  closeSocket() {
+    const ws = this.ws
+    this.ws = null
+    if (!ws) return
+    ws.onopen = null
+    ws.onmessage = null
+    ws.onclose = null
+    try {
+      ws.close()
+    } catch {
+      /* already closed */
+    }
+  }
+
+  clearReconnect() {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
+  }
+
+  send(data) {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(data)
+  }
+
+  sendAwareness(clients) {
+    const encoder = this.vendor.encoding.createEncoder()
+    this.vendor.encoding.writeVarUint(encoder, 1) // MESSAGE_AWARENESS
+    this.vendor.encoding.writeVarUint8Array(encoder, this.vendor.encodeAwarenessUpdate(this.awareness, clients))
+    this.send(this.vendor.encoding.toUint8Array(encoder))
+  }
+
+  handleMessage(data) {
+    const { encoding, decoding, syncProtocol } = this.vendor
+    const decoder = decoding.createDecoder(data)
+    while (decoding.hasContent(decoder)) {
+      const messageType = decoding.readVarUint(decoder)
+      if (messageType === 0) {
+        // MESSAGE_SYNC: applies step2/update with origin `this`, buffers step1/step2 answers.
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, 0)
+        syncProtocol.readSyncMessage(decoder, encoder, this.doc, this)
+        if (encoding.length(encoder) > 1) this.send(encoding.toUint8Array(encoder))
+        this.setSynced(true)
+      } else if (messageType === 1) {
+        // MESSAGE_AWARENESS
+        this.vendor.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), this)
+      } else if (messageType === 2) {
+        // MESSAGE_AUTH
+        const authState = decoding.readVarUint(decoder)
+        if (authState === 0) {
+          const reason = decoding.readVarString(decoder)
+          // The server ends the session right after this frame; reconnecting would only loop.
+          this.shouldConnect = false
+          this.clearReconnect()
+          this.closeSocket()
+          this.setSynced(false)
+          this.setStatus('denied')
+          this.emit('denied', reason)
+        }
+      }
+      // Types 3 (query awareness) and 42 (doc moved) are server->client directions the editor
+      // does not act on; unknown frames are ignored, the document state stays authoritative.
+    }
+  }
+
+  setStatus(status) {
+    if (this.status === status) return
+    this.status = status
+    this.emit('status', status)
+  }
+
+  setSynced(synced) {
+    if (this.synced === synced) return
+    this.synced = synced
+    this.emit('synced', synced)
   }
 }
 

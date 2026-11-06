@@ -1313,3 +1313,47 @@ td.mono,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* realtime file editor (CodeMirror 6 + Yjs) */
+
+.editor-status {
+  margin-right: auto;
+}
+
+.editor-status.syncing {
+  color: var(--accent);
+  border-color: rgba(110, 168, 254, 0.3);
+  background: var(--accent-soft);
+}
+
+.editor-status.live {
+  color: var(--green);
+  border-color: rgba(93, 214, 160, 0.3);
+  background: var(--green-soft);
+}
+
+.editor-status.error {
+  color: var(--red);
+  border-color: rgba(255, 122, 122, 0.3);
+  background: var(--red-soft);
+}
+
+.editor-root {
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.editor-root .cm-editor {
+  height: min(62vh, 640px);
+}
+
+.editor-root .cm-editor.cm-focused {
+  outline: none;
+}
+
+.editor-root .cm-scroller {
+  font-family: var(--mono);
+}

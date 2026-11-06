@@ -10,12 +10,16 @@ use meisync_api::AppState;
 const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
+/// Prebuilt vendor bundle (Yjs + CodeMirror 6) for the realtime file editor; regenerated with
+/// `cd web && npm run build:admin-vendor` and committed so the console stays build-step free.
+const VENDOR_JS: &str = include_str!("../web/vendor/bundle.js");
 
 pub fn ui_router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(index))
         .route("/admin/", get(index))
         .route("/admin/app.js", get(app_js))
+        .route("/admin/vendor/bundle.js", get(vendor_js))
         .route("/admin/styles.css", get(styles))
         .route("/admin/api-info", get(crate::routes::api_info))
 }
@@ -26,6 +30,10 @@ async fn index() -> Response {
 
 async fn app_js() -> Response {
     asset(APP_JS, "text/javascript; charset=utf-8")
+}
+
+async fn vendor_js() -> Response {
+    asset(VENDOR_JS, "text/javascript; charset=utf-8")
 }
 
 async fn styles() -> Response {
