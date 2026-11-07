@@ -56,6 +56,14 @@ pub const YSYNC_MOUNT: &str = "/ysync";
 /// lib0 var-uint, so anything >= 0x80 would corrupt the frame.
 pub const MSG_DOC_MOVED: u8 = 42;
 
+/// Query parameter a client uses to declare the sync protocol it speaks.
+///
+/// Absent means protocol 1: the conservative default, so that a client built before the value
+/// shape existed is never handed a document it cannot read (`docs/structured-json-docs.md` §6.4).
+pub const PROTOCOL_QUERY: &str = "protocol";
+/// Lowest protocol that understands the `value` content shape.
+pub const VALUE_SHAPE_PROTOCOL: u32 = 2;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/ysync", get(upgrade_root))
@@ -175,6 +183,21 @@ async fn upgrade_inner(
         .open_document(&user, path)
         .await
         .map_err(ApiError)?;
+    // A whole-value document carries its bytes in a `Y.Map` register, not in `Y.Text("content")`.
+    // A protocol 1 client would read an empty text root and could write that emptiness back, so it
+    // is refused the live document and keeps using the HTTP file API instead (§6.4).
+    let content_type = meta
+        .content_type
+        .clone()
+        .unwrap_or_else(|| meisync_core::guess_content_type(&meta.name));
+    if meisync_core::content_shape(&content_type) == meisync_core::ContentShape::Value
+        && protocol_version(&parts) < VALUE_SHAPE_PROTOCOL
+    {
+        return Err(ApiError(MeiSyncError::Conflict(format!(
+            "{path} is a whole-value document (content shape `value`): live sync needs protocol \
+             {VALUE_SHAPE_PROTOCOL}, use the HTTP file API instead"
+        ))));
+    }
     // `SYNC` is the read gate of the room; writing an update additionally needs `WRITE`
     // (owner or an explicit ACL grant) – a public document is read+sync only (§12).
     let can_write = state
@@ -198,6 +221,21 @@ async fn upgrade_inner(
             }
         }
     }))
+}
+
+/// Sync protocol declared by the client (`?protocol=2`), protocol 1 when absent.
+fn protocol_version(parts: &axum::http::request::Parts) -> u32 {
+    parts
+        .uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| {
+            pair.strip_prefix(PROTOCOL_QUERY)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
 }
 
 fn protocol_token(headers: &axum::http::HeaderMap) -> Option<String> {

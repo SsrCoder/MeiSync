@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meisync_core::{FileId, FileMetadata, Result, SyncMode};
+use meisync_core::{
+    content_shape, read_text, read_value, ContentShape, FileId, FileMetadata, Result, SyncMode,
+};
 use meisync_persistence::fs_store::{CompactionPolicy, DocumentStore};
 use meisync_persistence::{FileRepository, YDocRepository};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use yrs::{ReadTxn, StateVector, Transact};
 
-use crate::loaded::{restore_document, DocumentHandle};
+use crate::loaded::{restore_document, DocumentHandle, LoadedDocument};
 use crate::room::{ConnId, Room, RoomEvent};
 
 /// Tuning knobs for the YDoc cache / lifecycle (`docs/mvp.md` §22, §23, §35 §36).
@@ -179,6 +182,7 @@ impl DocumentManager {
         };
         loaded.sync_mode = meta.sync_mode;
         loaded.encoding = meisync_core::content_encoding(meta.content_type.as_deref());
+        loaded.shape = content_shape(meta.content_type.as_deref().unwrap_or(""));
         // The per-document revision is authoritative in SQLite: it is bumped on every write and
         // must survive an unload (§26, monotonic revisions).
         loaded.version = meta.version;
@@ -188,6 +192,7 @@ impl DocumentManager {
             }
             loaded.sync_mode = record.sync_mode;
         }
+        self.migrate_to_value_shape(&meta, &mut loaded).await?;
         // Keep the cached metadata in sync with the authoritative YDoc state (§26).
         loaded.etag = crate::loaded::state_etag(&loaded.full_state());
         loaded.size = loaded.bytes().len() as u64;
@@ -217,6 +222,60 @@ impl DocumentManager {
         // a second `yrs::Doc` (§24).
         self.enforce_capacity(Some(&meta.id)).await;
         Ok(handle)
+    }
+
+    /// Lazy migration of a whole-value document that was written before the value shape existed
+    /// (`docs/structured-json-docs.md` §7).
+    ///
+    /// The bytes are copied from `Y.Text("content")` into the `Y.Map("value")` register in one
+    /// transaction, which is appended to the update log right away so the copy survives an unload.
+    /// The old root is left untouched: Yjs never removes a root type, and keeping it is what makes
+    /// a rollback (`content_shape` back to `Text`) lossless.
+    async fn migrate_to_value_shape(
+        &self,
+        meta: &FileMetadata,
+        loaded: &mut LoadedDocument,
+    ) -> Result<()> {
+        if loaded.shape != ContentShape::Value || read_value(&loaded.doc).is_some() {
+            return Ok(());
+        }
+        let legacy = read_text(&loaded.doc);
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let update = meisync_core::replace_content(
+            &loaded.doc,
+            &meisync_core::TransactionOrigin::system("migrate"),
+            ContentShape::Value,
+            &legacy,
+        );
+        if loaded.sync_mode == SyncMode::Full {
+            // Full Sync keeps no update log; `load()` persists the state right after this call.
+            return Ok(());
+        }
+        let seq = self.store.append_update(&meta.id, &update).await?;
+        loaded.update_seq = seq;
+        loaded.update_count += 1;
+        loaded.update_bytes += update.len() as u64;
+        loaded.dirty = true;
+        self.ydocs.record_update(&meta.id, seq).await?;
+        // The migration *is* a state change, so the cached metadata has to follow it: a manifest
+        // ETag (SQLite) that disagrees with the GET ETag of the same file is a §26 violation, and
+        // a cached size of 0 would be a lie until the next write.
+        let state = {
+            let txn = loaded.doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let etag = crate::loaded::state_etag(&state);
+        let size = loaded.bytes().len() as u64;
+        loaded.version = self
+            .files
+            .touch_content(&meta.id, size, etag.clone(), None, None)
+            .await?;
+        loaded.etag = etag;
+        loaded.size = size;
+        info!(file_id = %meta.id, bytes = legacy.len(), "migrated text content into the value register");
+        Ok(())
     }
 
     /// Handle if the document happens to be cached, without loading it.
