@@ -1,6 +1,6 @@
 # MeiSync 结构化文档（ContentShape）改动方案
 
-**状态：** 提案 / 待评审
+**状态：** 已实现（实现记录见 §13）
 **影响面：** `crates/core`、`crates/document`、`crates/api`、`crates/ysync`
 **关联：** `docs/mvp.md` §2.2（YDoc 是唯一 Source of Truth）、§2.3（所有写操作进入 YDoc）、§6（YDoc 内容模型）、§26（ETag）、§37（一致性原则）
 **不改：** WebDAV / S3 的对外协议与语义、持久化格式（snapshot + update log）、行导向文本文件（`.jsonl` / `.md` / `.txt`）的同步方式
@@ -254,10 +254,43 @@ match (local == baseline, doc_value == baseline) {
 
 ## 12. 改动清单（供评审勾选）
 
-- [ ] `crates/core/src/file.rs`：`ContentShape` + `content_shape()`；`replace_content()` 分支；`materialize_string()` 改走 `LoadedDocument::content()`
-- [ ] `crates/document/src/loaded.rs`：`content()` 分支；`restore_document()` / `empty_document()` 的 `size` 统一；`prime_text()` 分支
-- [ ] `crates/api/src/sync.rs`：`SYNC_PROTOCOL_VERSION = 2`；`capabilities += "structured-docs"`；`SyncEntry.shape`
-- [ ] `crates/ysync`：`Value` 形状的文件建立 `Y.Map` 根；protocol 1 客户端对该类文件不建 live doc
-- [ ] 懒迁移（`content` → `value`）
-- [ ] 测试（§10）
-- [ ] 文档：`docs/mvp.md` §6 / §37
+- [x] `crates/core/src/file.rs`：`ContentShape` + `content_shape()`；`replace_content()` 分支；`materialize_string()` 改走 `document_content()`（见 §13.1）
+- [x] `crates/document/src/loaded.rs`：`content()` 分支；`restore_document()` / `empty_document()` 的 `size` 统一；`prime_content()` 分支
+- [x] `crates/api/src/sync.rs`：`SYNC_PROTOCOL_VERSION = 2`；`capabilities += "structured-docs"`；`SyncEntry.shape`
+- [x] `crates/ysync`：protocol 1 客户端对 `Value` 形状文件不建 live doc（见 §13.3）
+- [x] 懒迁移（`content` → `value`，见 §13.4）
+- [x] 测试（§10，见 §13.5）
+- [x] 文档：`docs/mvp.md` §6 / §37
+
+---
+
+## 13. 实现记录
+
+落地时相对上文做了四处收窄或明确，都不改变语义：
+
+### 13.1 「唯一实现」放在 `core`，不在 `LoadedDocument`
+
+§5 第 1 条要求 `LoadedDocument::content()` 是唯一实现，但 `core` 不能依赖 `document`（方向相反），
+而 `FileDocument::materialize_string()` 在 `core` 里。因此唯一实现是
+`meisync_core::document_content(doc, shape)`，`LoadedDocument::content()` 与
+`materialize_string()` 都调用它 —— 调用图与验收要点（「不允许出现第二处从 YDoc 算内容的代码」）一致。
+
+### 13.2 读取带一次回退
+
+`document_content` 先读当前形状对应的根；若为空，再读另一个根。这覆盖两种情况，避免「无声读空」：
+
+* §7 的懒迁移尚未发生（老文档的字节还在 `Y.Text`）；
+* 内容类型改变了形状（`.json` 被按 `image/png` 覆写），旧根里还有数据。
+
+### 13.3 protocol 1 的门用查询参数声明
+
+`/ysync/<path>?token=…&protocol=2`。**缺少该参数按 protocol 1 处理**，这是保守默认：今天的
+web / obsidian-plugin 客户端不带参数，因此它们对 `Value` 文件会被拒绝并继续走 HTTP（§6.4）。
+服务端拒绝时返回 `409 Conflict`，消息里指明需要 protocol 2。
+
+### 13.4 懒迁移发生在 `DocumentManager::load`
+
+`restore_document()` 没有 metadata（因此没有形状）也没有写 update log 的入口，所以迁移在
+`load()` 里：设置形状后，若形状是 `Value` 而寄存器不存在、`Y.Text` 有内容，则在一个事务里
+`map.insert`，并立刻追加到 update log（`Full` 模式的文档由随后的 snapshot 覆盖）。
+旧 `content` 根原样保留，回滚仍然无损（§7.4）。
