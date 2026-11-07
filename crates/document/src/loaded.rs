@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use chrono::Utc;
 use meisync_core::{
-    content_encoding, decode_content, encode_content, replace_content, ContentEncoding, FileId,
-    FileMetadata, MeiSyncError, Preconditions, Result, SyncMode, TransactionOrigin, UserId,
+    content_encoding, content_shape, decode_content, document_content, encode_content,
+    replace_content, ContentEncoding, ContentShape, FileId, FileMetadata, MeiSyncError,
+    Preconditions, Result, SyncMode, TransactionOrigin, UserId,
 };
 use meisync_persistence::fs_store::{CompactionPolicy, DocumentStore, UpdateSeq};
 use meisync_persistence::{FileRepository, YDocRepository};
@@ -22,6 +23,11 @@ pub struct LoadedDocument {
     pub sync_mode: SyncMode,
     /// How the bytes are represented inside `Y.Text("content")`.
     pub encoding: ContentEncoding,
+    /// Which root type carries the content: `Y.Text` (text) or the `Y.Map` register (value).
+    ///
+    /// Derived from the document's content type, never persisted
+    /// (`docs/structured-json-docs.md` §4.1).
+    pub shape: ContentShape,
     /// Number of updates currently in the on disk log.
     pub update_count: u64,
     pub update_bytes: u64,
@@ -53,8 +59,12 @@ impl LoadedDocument {
         txn.encode_diff_v1(sv)
     }
 
+    /// Materialised text of the file, in the shape its content type asks for.
+    ///
+    /// This is the read path of every protocol; `docs/structured-json-docs.md` §5 requires it to be
+    /// the only place that turns a YDoc into content.
     pub fn content(&self) -> String {
-        meisync_core::read_text(&self.doc)
+        document_content(&self.doc, self.shape)
     }
 
     /// Materialised bytes of the file.
@@ -200,6 +210,10 @@ impl DocumentHandle {
         guard.last_access = Instant::now();
         if let Some(content_type) = content_type.as_deref() {
             guard.encoding = content_encoding(Some(content_type));
+            // The shape follows the resolved content type. A shape that changes (`a.json`
+            // overwritten as an image) writes the new root; the old one keeps its data and is
+            // simply not read any more (`document_content` prefers the root that holds content).
+            guard.shape = content_shape(content_type);
             if guard.sync_mode != SyncMode::Full {
                 guard.sync_mode =
                     meisync_core::guess_sync_mode(Some(content_type));
@@ -222,7 +236,7 @@ impl DocumentHandle {
                 sync_mode: guard.sync_mode,
             });
         }
-        let update = replace_content(&guard.doc, &origin, meisync_core::ContentShape::Text, &text);
+        let update = replace_content(&guard.doc, &origin, guard.shape, &text);
         let mut snapshot = finish_mutation(
             &mut guard,
             update.clone(),
@@ -416,12 +430,16 @@ pub async fn restore_document(
         txn.encode_state_as_update_v1(&StateVector::default())
     };
     let etag = state_etag(&state);
-    let size = meisync_core::read_text(&doc).len() as u64;
+    // Same function as `LoadedDocument::content()`: a restart must not compute the size from a
+    // different root than the read path (`docs/structured-json-docs.md` §5, item 2).
+    let shape = ContentShape::Text;
+    let size = document_content(&doc, shape).len() as u64;
 
     Ok(LoadedDocument {
         file_id: file_id.clone(),
         doc,
         encoding: ContentEncoding::Text,
+        shape,
         sync_mode: SyncMode::Incremental,
         update_count: count,
         update_bytes: bytes,
@@ -438,11 +456,13 @@ pub async fn restore_document(
 /// Create a brand new, empty YDoc for a freshly created file.
 pub fn empty_document(file_id: &FileId, meta: &FileMetadata) -> LoadedDocument {
     let doc = Doc::new();
-    let content = meisync_core::read_text(&doc);
+    let shape = content_shape(meta.content_type.as_deref().unwrap_or(""));
+    let content = document_content(&doc, shape);
     LoadedDocument {
         file_id: file_id.clone(),
         doc,
         encoding: content_encoding(meta.content_type.as_deref()),
+        shape,
         sync_mode: meta.sync_mode,
         update_count: 0,
         update_bytes: 0,
@@ -456,17 +476,12 @@ pub fn empty_document(file_id: &FileId, meta: &FileMetadata) -> LoadedDocument {
     }
 }
 
-/// Ensure the root text type exists so materialised content is always defined.
-pub fn prime_text(doc: &Doc, text: &str) {
+/// Ensure the root type of the document's shape exists, so materialised content is always defined.
+pub fn prime_content(doc: &Doc, shape: ContentShape, text: &str) {
     if text.is_empty() {
         return;
     }
-    replace_content(
-        doc,
-        &TransactionOrigin::system("init"),
-        meisync_core::ContentShape::Text,
-        text,
-    );
+    replace_content(doc, &TransactionOrigin::system("init"), shape, text);
 }
 
 /// Persist the very first state of a new document, so the file exists even before the first write.
