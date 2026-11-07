@@ -682,3 +682,42 @@ async fn lazy_migration_copies_a_legacy_text_document_into_the_register() {
     let doc = handle.raw_doc().await;
     assert_eq!(meisync_core::read_value(&doc).as_deref(), Some(legacy));
 }
+
+/// The migration changes the document state, so the cached metadata must follow it: a manifest
+/// ETag (SQLite) that disagrees with the GET ETag (in-memory YDoc) of the same file is a §26 bug.
+#[tokio::test]
+async fn lazy_migration_refreshes_the_cached_metadata() {
+    let f = fixture_json().await;
+    let legacy = r#"{"legacy":true}"#;
+    let doc = yrs::Doc::new();
+    let update = meisync_core::replace_content(
+        &doc,
+        &meisync_core::TransactionOrigin::system("legacy"),
+        meisync_core::ContentShape::Text,
+        legacy,
+    );
+    let seq = f
+        .store
+        .append_update(&f.meta.id, &update)
+        .await
+        .expect("append");
+    YDocRepository::new(f.db.clone())
+        .record_update(&f.meta.id, seq)
+        .await
+        .expect("record");
+
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    let snapshot = handle.read().await;
+    let meta = FileRepository::new(f.db.clone())
+        .find_by_id(&f.meta.id)
+        .await
+        .expect("find")
+        .expect("row");
+    assert_eq!(meta.size, snapshot.size, "the cached size must follow the migration");
+    assert_eq!(
+        meta.etag.as_deref(),
+        Some(snapshot.etag.as_str()),
+        "the cached etag must follow the migration"
+    );
+    assert_eq!(meta.version, snapshot.version, "and so must the revision");
+}

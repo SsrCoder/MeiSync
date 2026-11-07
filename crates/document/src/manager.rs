@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meisync_core::{content_shape, read_text, read_value, ContentShape, FileId, FileMetadata, Result, SyncMode};
+use meisync_core::{
+    content_shape, read_text, read_value, ContentShape, FileId, FileMetadata, Result, SyncMode,
+};
 use meisync_persistence::fs_store::{CompactionPolicy, DocumentStore};
 use meisync_persistence::{FileRepository, YDocRepository};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use yrs::{ReadTxn, StateVector, Transact};
 
 use crate::loaded::{restore_document, DocumentHandle, LoadedDocument};
 use crate::room::{ConnId, Room, RoomEvent};
@@ -256,6 +259,21 @@ impl DocumentManager {
         loaded.update_bytes += update.len() as u64;
         loaded.dirty = true;
         self.ydocs.record_update(&meta.id, seq).await?;
+        // The migration *is* a state change, so the cached metadata has to follow it: a manifest
+        // ETag (SQLite) that disagrees with the GET ETag of the same file is a §26 violation, and
+        // a cached size of 0 would be a lie until the next write.
+        let state = {
+            let txn = loaded.doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let etag = crate::loaded::state_etag(&state);
+        let size = loaded.bytes().len() as u64;
+        loaded.version = self
+            .files
+            .touch_content(&meta.id, size, etag.clone(), None, None)
+            .await?;
+        loaded.etag = etag;
+        loaded.size = size;
         info!(file_id = %meta.id, bytes = legacy.len(), "migrated text content into the value register");
         Ok(())
     }
