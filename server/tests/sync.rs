@@ -424,12 +424,82 @@ async fn sync_info_advertises_the_protocol() {
     assert_eq!(response.status(), StatusCode::OK);
     let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     assert_eq!(value["service"], "meisync");
-    assert_eq!(value["protocol"], 1);
+    assert_eq!(value["protocol"], 2);
     assert!(value["capabilities"]
         .as_array()
         .unwrap()
         .iter()
         .any(|entry| entry == "manifest"));
+    // Protocol 2 announces the content shape of every file (§6).
+    assert!(value["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "structured-docs"));
+}
+
+#[tokio::test]
+async fn manifest_reports_the_content_shape() {
+    let harness = Harness::spawn().await;
+    let token = harness.register("alice").await;
+    let hs = handshake(&harness, &token, "obsidian/MyVault").await;
+    assert_eq!(hs["protocol"], 2);
+    assert!(hs["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "structured-docs"));
+
+    let files = [
+        ("recommendations.json", "application/json", r#"{"items":[]}"#),
+        ("library.jsonl", "application/x-ndjson", "{\"id\":1}\n"),
+        ("notes.md", "text/markdown", "# hi"),
+    ];
+    for (path, content_type, body) in files {
+        let response = harness
+            .send(harness.request_with_body(
+                "PUT",
+                &sync_url("file", "obsidian/MyVault", path),
+                Some(&token),
+                Some(content_type),
+                body,
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "PUT {path}");
+    }
+
+    let response = harness
+        .send(harness.request(
+            "GET",
+            "/api/sync/manifest?vault=obsidian%2FMyVault",
+            Some(&token),
+        ))
+        .await;
+    let manifest: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let entries = manifest["entries"].as_array().unwrap();
+    let shape_of = |path: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["path"] == path)
+            .unwrap_or_else(|| panic!("{path} in manifest"))["shape"]
+            .as_str()
+            .unwrap_or("<missing>")
+            .to_string()
+    };
+    // A whole-value file is a register; line oriented JSON and markdown stay text.
+    assert_eq!(shape_of("recommendations.json"), "value");
+    assert_eq!(shape_of("library.jsonl"), "text");
+    assert_eq!(shape_of("notes.md"), "text");
+
+    // The bytes still round-trip unchanged through the value shape.
+    let response = harness
+        .send(harness.request(
+            "GET",
+            &sync_url("file", "obsidian/MyVault", "recommendations.json"),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(body_bytes(response).await, br#"{"items":[]}"#.to_vec());
 }
 
 #[tokio::test]
