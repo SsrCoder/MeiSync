@@ -956,3 +956,109 @@ async fn a_failed_namespace_provisioning_leaves_no_account_behind() {
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+// -------------------------------------------------------------------------------------------
+// Whole-value documents (`docs/structured-json-docs.md` §8, §10)
+// -------------------------------------------------------------------------------------------
+
+/// WebDAV GET of a `.json` file, for a top level object and a top level array.
+#[tokio::test]
+async fn webdav_get_value_shape_json() {
+    let harness = Harness::spawn().await;
+    let token = harness.register("alice").await;
+
+    // The shape only decides *how* the bytes are carried, not which JSON is allowed.
+    for (path, body) in [
+        ("/dav/private/alice/object.json", r#"{"items":[1,2],"seen":[]}"#),
+        ("/dav/private/alice/array.json", r#"[{"id":"a"},{"id":"b"}]"#),
+    ] {
+        let response = harness
+            .send(harness.request_with_body(
+                "PUT",
+                path,
+                Some(&token),
+                Some("application/json"),
+                body,
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "PUT {path}");
+
+        let response = harness.send(harness.request("GET", path, Some(&token))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(body_string(response).await, body, "GET {path}");
+    }
+}
+
+/// PUT → HEAD → PROPFIND → GET round trip of a whole-value file: the metadata caches must agree
+/// with the materialised bytes, before and after a reload.
+#[tokio::test]
+async fn put_get_roundtrip_value_shape() {
+    let harness = Harness::spawn().await;
+    let token = harness.register("alice").await;
+    let path = "/dav/private/alice/recommendations.json";
+    let body = r#"{"generated_at_ms":1793989745600,"items":[{"id":"a"}],"seen":["a"]}"#;
+
+    let response = harness
+        .send(harness.request_with_body(
+            "PUT",
+            path,
+            Some(&token),
+            Some("application/json"),
+            body,
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_string();
+
+    // HEAD reports the real length, not 0.
+    let response = harness.send(harness.request("HEAD", path, Some(&token))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        &body.len().to_string().as_str()
+    );
+
+    // PROPFIND reports the same length.
+    let response = harness
+        .send(harness.request("PROPFIND", path, Some(&token)))
+        .await;
+    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+    let xml = body_string(response).await;
+    assert!(
+        xml.contains(&format!("<D:getcontentlength>{}</D:getcontentlength>", body.len())),
+        "{xml}"
+    );
+
+    // GET returns the bytes verbatim.
+    let response = harness.send(harness.request("GET", path, Some(&token))).await;
+    assert_eq!(body_string(response).await, body);
+
+    // Conditional writes still work on the value shape (§25).
+    let request = harness
+        .request_with_body("PUT", path, Some(&token), Some("application/json"), r#"{"v":2}"#)
+        .clone_header("if-match", &etag);
+    assert_eq!(
+        harness.send(request).await.status(),
+        StatusCode::NO_CONTENT,
+        "a WebDAV PUT of an existing resource answers 204"
+    );
+    let request = harness
+        .request_with_body("PUT", path, Some(&token), Some("application/json"), r#"{"v":3}"#)
+        .clone_header("if-match", &etag);
+    assert_eq!(
+        harness.send(request).await.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+}
