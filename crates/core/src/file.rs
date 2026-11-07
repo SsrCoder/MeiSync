@@ -3,12 +3,62 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use yrs::{Doc, GetString, ReadTxn, Text, Transact, TransactionMut, WriteTxn};
+use yrs::{Doc, GetString, Map, ReadTxn, Text, Transact, TransactionMut, WriteTxn};
 
 use crate::user::UserId;
 
 /// Root name of the shared text type inside every YDoc (`docs/mvp.md` §6).
 pub const CONTENT_KEY: &str = "content";
+
+/// Root name of the whole-value register inside a `Value` shaped YDoc.
+///
+/// A `Value` document keeps the complete file body in a single key of a `Y.Map`, so a write is one
+/// atomic register replacement instead of a character splice (`docs/structured-json-docs.md` §4.2).
+pub const VALUE_ROOT: &str = "value";
+/// Key of the register inside [`VALUE_ROOT`].
+pub const VALUE_KEY: &str = "value";
+
+/// How a file's bytes are carried by its YDoc (`docs/structured-json-docs.md` §4.1).
+///
+/// ```text
+/// Text   YDoc -> Y.Text("content")     human editable / line oriented (.md, .txt, .jsonl)
+/// Value  YDoc -> Y.Map("value")        whole value replacement (application/json)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentShape {
+    /// A single `Y.Text` root: characters merge, which is right for line oriented formats.
+    Text,
+    /// A single `Y.Map` root holding one key: whole-value writes are atomic registers.
+    Value,
+}
+
+impl ContentShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentShape::Text => "text",
+            ContentShape::Value => "value",
+        }
+    }
+}
+
+/// The content shape a content type asks for.
+///
+/// Derived from the content type, never stored: `.json` (and any `application/json`) is a whole
+/// value, everything else stays text. `application/x-ndjson` is deliberately *not* a value: those
+/// files are line oriented and merge correctly as text.
+pub fn content_shape(content_type: &str) -> ContentShape {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.starts_with("application/json") {
+        ContentShape::Value
+    } else {
+        ContentShape::Text
+    }
+}
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -398,7 +448,10 @@ impl FileDocument {
     }
 
     pub fn materialize_string(&self) -> String {
-        read_text(&self.doc)
+        document_content(
+            &self.doc,
+            content_shape(&self.effective_content_type()),
+        )
     }
 
     /// Content type used when a client did not provide one.
@@ -426,15 +479,33 @@ impl std::fmt::Debug for FileDocument {
 ///
 /// This is the core of `replace_content()`: a WebDAV `PUT` / S3 `PutObject` never writes to the
 /// filesystem directly, it turns the full body into a YDoc transaction (`docs/mvp.md` §7, §8).
-pub fn replace_content(doc: &Doc, origin: &TransactionOrigin, content: &str) -> Vec<u8> {
+///
+/// * `ContentShape::Text` deletes the characters and inserts the new ones – two concurrent writers
+///   splice, which is what line oriented formats want;
+/// * `ContentShape::Value` overwrites one register – two concurrent writers produce exactly one
+///   winning value, chosen by the CRDT, never a splice of both (`docs/structured-json-docs.md` §4).
+pub fn replace_content(
+    doc: &Doc,
+    origin: &TransactionOrigin,
+    shape: ContentShape,
+    content: &str,
+) -> Vec<u8> {
     let mut txn = doc.transact_mut_with(origin.clone());
-    let text = txn.get_or_insert_text(CONTENT_KEY);
-    let len = text.len(&txn);
-    if len > 0 {
-        text.remove_range(&mut txn, 0, len);
-    }
-    if !content.is_empty() {
-        text.push(&mut txn, content);
+    match shape {
+        ContentShape::Text => {
+            let text = txn.get_or_insert_text(CONTENT_KEY);
+            let len = text.len(&txn);
+            if len > 0 {
+                text.remove_range(&mut txn, 0, len);
+            }
+            if !content.is_empty() {
+                text.push(&mut txn, content);
+            }
+        }
+        ContentShape::Value => {
+            let map = txn.get_or_insert_map(VALUE_ROOT);
+            map.insert(&mut txn, VALUE_KEY, content.to_string());
+        }
     }
     txn.encode_update_v1()
 }
@@ -471,6 +542,41 @@ pub fn read_text(doc: &Doc) -> String {
     match txn.get_text(CONTENT_KEY) {
         Some(text) => text.get_string(&txn),
         None => String::new(),
+    }
+}
+
+/// Read the whole-value register, if this document has one.
+pub fn read_value(doc: &Doc) -> Option<String> {
+    let txn = doc.transact();
+    let map = txn.get_map(VALUE_ROOT)?;
+    let out = map.get(&txn, VALUE_KEY)?;
+    Some(out.to_string(&txn))
+}
+
+/// Materialised content of a document, in the shape its content type asks for.
+///
+/// This is the **only** place that turns a YDoc into file content: the read path of every protocol
+/// (WebDAV GET, S3 GetObject, YSync, JSON API), the size cache and the restart path all go through
+/// it (`docs/structured-json-docs.md` §5, 验收要点).
+///
+/// The fallback keeps two cases readable instead of silently empty:
+///
+/// * a document written before the value shape existed still holds its bytes in `Y.Text` and is
+///   read from there until it is migrated (§7);
+/// * a document whose content type changed shape (a `.json` file overwritten as an image) keeps
+///   answering with whatever root actually holds content.
+pub fn document_content(doc: &Doc, shape: ContentShape) -> String {
+    let (primary, secondary) = match shape {
+        ContentShape::Text => (read_text(doc), read_value(doc).unwrap_or_default()),
+        ContentShape::Value => (
+            read_value(doc).unwrap_or_default(),
+            read_text(doc),
+        ),
+    };
+    if primary.is_empty() {
+        secondary
+    } else {
+        primary
     }
 }
 
@@ -517,8 +623,96 @@ pub fn guess_content_type(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_encoding, guess_sync_mode, resolve_content_type, ContentEncoding, SyncMode,
+        content_encoding, content_shape, document_content, guess_sync_mode, read_text, read_value,
+        replace_content, resolve_content_type, ContentEncoding, ContentShape, SyncMode,
+        TransactionOrigin,
     };
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+
+    fn apply(target: &Doc, update: &[u8]) {
+        let mut txn = target.transact_mut();
+        txn.apply_update(Update::decode_v1(update).expect("decode"))
+            .expect("apply");
+    }
+
+    #[test]
+    fn json_is_a_value_shape() {
+        // Whole-value files: the register shape is the only one that can replace them atomically.
+        assert_eq!(content_shape("application/json"), ContentShape::Value);
+        assert_eq!(
+            content_shape("application/json; charset=utf-8"),
+            ContentShape::Value
+        );
+        assert_eq!(content_shape(" Application/JSON "), ContentShape::Value);
+        // Line oriented JSON stays text: it merges by line, which is what those files want.
+        assert_eq!(content_shape("application/x-ndjson"), ContentShape::Text);
+        assert_eq!(content_shape("text/markdown"), ContentShape::Text);
+        assert_eq!(content_shape(""), ContentShape::Text);
+    }
+
+    #[test]
+    fn a_value_shape_round_trips_through_one_register() {
+        let doc = Doc::new();
+        let origin = TransactionOrigin::system("test");
+
+        let update = replace_content(&doc, &origin, ContentShape::Value, "{\"a\":1}");
+        assert!(!update.is_empty());
+        assert_eq!(document_content(&doc, ContentShape::Value), "{\"a\":1}");
+        // The text root stays empty: a value document carries no characters at all.
+        assert_eq!(read_text(&doc), "");
+        assert_eq!(read_value(&doc).as_deref(), Some("{\"a\":1}"));
+
+        // A second write replaces the register, it does not append to it.
+        replace_content(&doc, &origin, ContentShape::Value, "{\"a\":2}");
+        assert_eq!(document_content(&doc, ContentShape::Value), "{\"a\":2}");
+    }
+
+    #[test]
+    fn a_text_shape_still_writes_characters() {
+        let doc = Doc::new();
+        let origin = TransactionOrigin::system("test");
+        replace_content(&doc, &origin, ContentShape::Text, "hello");
+        assert_eq!(document_content(&doc, ContentShape::Text), "hello");
+        assert_eq!(read_value(&doc), None);
+    }
+
+    #[test]
+    fn concurrent_value_writes_keep_exactly_one_value() {
+        // Two writers that both start from the same state and write without seeing each other.
+        let a = Doc::new();
+        let b = Doc::new();
+        let origin = TransactionOrigin::system("test");
+        replace_content(&a, &origin, ContentShape::Value, "{\"v\":0}");
+        let shared = a.transact().encode_state_as_update_v1(&StateVector::default());
+        apply(&b, &shared);
+
+        let from_a = replace_content(&a, &origin, ContentShape::Value, "{\"v\":\"A\"}");
+        let from_b = replace_content(&b, &origin, ContentShape::Value, "{\"v\":\"B\"}");
+        apply(&a, &from_b);
+        apply(&b, &from_a);
+
+        let winner = document_content(&a, ContentShape::Value);
+        // One of the two values wins – never a splice of both, and both peers agree.
+        assert!(
+            winner == "{\"v\":\"A\"}" || winner == "{\"v\":\"B\"}",
+            "expected one of the two values, got {winner}"
+        );
+        assert_eq!(winner, document_content(&b, ContentShape::Value));
+    }
+
+    #[test]
+    fn a_value_document_that_was_never_migrated_reads_its_text() {
+        // Documents written before the value shape existed still hold their bytes in Y.Text;
+        // a read must never silently turn them into an empty file (§7).
+        let doc = Doc::new();
+        let origin = TransactionOrigin::system("test");
+        replace_content(&doc, &origin, ContentShape::Text, "{\"legacy\":true}");
+        assert_eq!(
+            document_content(&doc, ContentShape::Value),
+            "{\"legacy\":true}"
+        );
+    }
 
     #[test]
     fn a_specific_declared_type_wins() {

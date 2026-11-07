@@ -21,10 +21,11 @@ pub mod user;
 pub use acl::{AclEntry, AclProvider, PermissionSet};
 pub use error::{MeiSyncError, Result};
 pub use file::{
-    content_encoding, decode_content, encode_content, guess_content_type, guess_sync_mode,
-    read_text, replace_content, resolve_content_type, ContentEncoding, FileDocument, FileId,
-    FileKind, FileMetadata, SyncMode, TransactionOrigin, Visibility, CONTENT_KEY,
-    GENERIC_CONTENT_TYPES,
+    content_encoding, content_shape, decode_content, document_content, encode_content,
+    guess_content_type, guess_sync_mode, read_text, read_value, replace_content,
+    resolve_content_type, ContentEncoding, ContentShape, FileDocument, FileId, FileKind,
+    FileMetadata, SyncMode, TransactionOrigin, Visibility, CONTENT_KEY, GENERIC_CONTENT_TYPES,
+    VALUE_KEY, VALUE_ROOT,
 };
 pub use permission::{PermissionService, VisibilityPermissionService};
 pub use precondition::{normalize_etag, Preconditions};

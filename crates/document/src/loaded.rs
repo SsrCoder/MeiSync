@@ -222,7 +222,7 @@ impl DocumentHandle {
                 sync_mode: guard.sync_mode,
             });
         }
-        let update = replace_content(&guard.doc, &origin, &text);
+        let update = replace_content(&guard.doc, &origin, meisync_core::ContentShape::Text, &text);
         let mut snapshot = finish_mutation(
             &mut guard,
             update.clone(),
@@ -461,7 +461,12 @@ pub fn prime_text(doc: &Doc, text: &str) {
     if text.is_empty() {
         return;
     }
-    replace_content(doc, &TransactionOrigin::system("init"), text);
+    replace_content(
+        doc,
+        &TransactionOrigin::system("init"),
+        meisync_core::ContentShape::Text,
+        text,
+    );
 }
 
 /// Persist the very first state of a new document, so the file exists even before the first write.
