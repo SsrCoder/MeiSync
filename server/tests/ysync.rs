@@ -605,3 +605,164 @@ async fn ysync_edits_are_published_on_the_file_change_feed() {
     assert_eq!(change.size, 11);
     assert!(change.etag.is_some(), "the event must carry the new ETag");
 }
+
+// -------------------------------------------------------------------------------------------
+// Whole-value documents (`docs/structured-json-docs.md` §6.4, §9)
+// -------------------------------------------------------------------------------------------
+
+async fn put_json(
+    state: &std::sync::Arc<meisync_api::AppState>,
+    token: &str,
+    path: &str,
+    body: &str,
+) {
+    use meisync_api::FileService;
+    let user = state.auth.authenticate(token).await.expect("auth");
+    state
+        .files
+        .replace_content(
+            &user,
+            path,
+            body.as_bytes().to_vec(),
+            Some("application/json".into()),
+        )
+        .await
+        .expect("put json");
+}
+
+/// The whole-value register of a client document, the way a protocol 2 client reads it.
+fn value_of(doc: &Doc) -> Option<String> {
+    use yrs::Map;
+    let txn = doc.transact();
+    let map = txn.get_map("value")?;
+    let out = map.get(&txn, "value")?;
+    Some(out.to_string(&txn))
+}
+
+async fn try_connect(
+    server: &YSyncServer,
+    token: &str,
+    path: &str,
+    extra_query: &str,
+) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+    let url = format!(
+        "ws://{}/ysync{}?token={}{}",
+        server.addr, path, token, extra_query
+    );
+    tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(url))
+        .await
+        .expect("connect timeout")
+        .map(|(socket, _)| socket)
+}
+
+#[tokio::test]
+async fn a_protocol_1_client_falls_back_to_http_for_a_value_document() {
+    let (server, state) = YSyncServer::spawn().await;
+    let token = register(&state, "alice").await;
+    put_json(&state, &token, "/private/alice/recommendations.json", r#"{"v":1}"#).await;
+
+    // A protocol 1 client does not know the `value` root and would read an empty text root –
+    // and could write that emptiness back. It is refused the live document, not the file.
+    let refused = try_connect(&server, &token, "/private/alice/recommendations.json", "").await;
+    assert!(
+        refused.is_err(),
+        "a protocol 1 client must not open a live doc for a value document"
+    );
+    // The HTTP path still answers with the real bytes: that is the fallback (§6.4).
+    assert_eq!(
+        get(&state, &token, "/private/alice/recommendations.json").await,
+        r#"{"v":1}"#
+    );
+
+    // A protocol 2 client joins and sees the value in the register.
+    let mut client = try_connect(
+        &server,
+        &token,
+        "/private/alice/recommendations.json",
+        "&protocol=2",
+    )
+    .await
+    .expect("protocol 2 handshake");
+    let doc = Doc::new();
+    handshake(&mut client, &doc).await;
+    assert_eq!(value_of(&doc).as_deref(), Some(r#"{"v":1}"#));
+    assert_eq!(content_of(&doc), "", "the text root stays empty");
+}
+
+#[tokio::test]
+async fn a_file_api_edit_reaches_a_value_shape_live_client() {
+    let (server, state) = YSyncServer::spawn().await;
+    let token = register(&state, "alice").await;
+    put_json(&state, &token, "/private/alice/recommendations.json", r#"{"v":1}"#).await;
+
+    let mut client = try_connect(
+        &server,
+        &token,
+        "/private/alice/recommendations.json",
+        "&protocol=2",
+    )
+    .await
+    .expect("protocol 2 handshake");
+    let doc = Doc::new();
+    handshake(&mut client, &doc).await;
+    assert_eq!(value_of(&doc).as_deref(), Some(r#"{"v":1}"#));
+
+    // A WebDAV PUT / S3 PutObject replaces the whole value and reaches the live client.
+    put_json(&state, &token, "/private/alice/recommendations.json", r#"{"v":2}"#).await;
+    let mut seen = None;
+    for _ in 0..8 {
+        let Some(frames) = try_recv(&mut client, Duration::from_secs(2)).await else {
+            break;
+        };
+        for frame in frames {
+            if let Message::Sync(SyncMessage::SyncStep2(bytes)) | Message::Sync(SyncMessage::Update(bytes)) = frame {
+                let update = Update::decode_v1(&bytes).expect("update");
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update).expect("apply");
+            }
+        }
+        seen = value_of(&doc);
+        if seen.as_deref() == Some(r#"{"v":2}"#) {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some(r#"{"v":2}"#),
+        "the whole-value write must reach the live client"
+    );
+}
+
+#[tokio::test]
+async fn a_protocol_2_client_can_write_the_value_register() {
+    let (server, state) = YSyncServer::spawn().await;
+    let token = register(&state, "alice").await;
+    put_json(&state, &token, "/private/alice/recommendations.json", r#"{"v":1}"#).await;
+
+    let mut client = try_connect(
+        &server,
+        &token,
+        "/private/alice/recommendations.json",
+        "&protocol=2",
+    )
+    .await
+    .expect("protocol 2 handshake");
+    let doc = Doc::new();
+    handshake(&mut client, &doc).await;
+
+    let update = {
+        use yrs::Map;
+        let mut txn = doc.transact_mut();
+        let map = txn.get_or_insert_map("value");
+        map.insert(&mut txn, "value", r#"{"v":"client"}"#.to_string());
+        txn.encode_update_v1()
+    };
+    send(&mut client, Message::Sync(SyncMessage::Update(update))).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        get(&state, &token, "/private/alice/recommendations.json").await,
+        r#"{"v":"client"}"#,
+        "a ysync write to the register is persisted like any other update"
+    );
+}

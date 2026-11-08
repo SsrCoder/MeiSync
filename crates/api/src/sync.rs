@@ -30,7 +30,25 @@ use crate::service::{Depth, FileService};
 use crate::state::AppState;
 
 /// Protocol version advertised by the handshake. Bumped when a breaking change is made.
-pub const SYNC_PROTOCOL_VERSION: u32 = 1;
+///
+/// * 1 – manifest + content + ETag conflicts.
+/// * 2 – every manifest entry carries `shape` (`text` | `value`); a client must not open a live
+///   YDoc for a `value` file before it knows which root type to read
+///   (`docs/structured-json-docs.md` §6).
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+
+/// Capabilities advertised by `/api/sync/info` and the handshake.
+pub const SYNC_CAPABILITIES: &[&str] = &[
+    "manifest",
+    "content",
+    "etag-conflict",
+    "move",
+    "mkdir",
+    "websocket",
+    "devices",
+    "binary",
+    "structured-docs",
+];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -135,16 +153,7 @@ pub async fn info(State(state): State<AppState>) -> Json<SyncInfo> {
         service: "meisync",
         version: env!("CARGO_PKG_VERSION"),
         protocol: SYNC_PROTOCOL_VERSION,
-        capabilities: vec![
-            "manifest",
-            "content",
-            "etag-conflict",
-            "move",
-            "mkdir",
-            "websocket",
-            "devices",
-            "binary",
-        ],
+        capabilities: SYNC_CAPABILITIES.to_vec(),
         max_body_bytes: state.config.max_body_bytes,
         conflict_model: "etag",
     })
@@ -215,16 +224,7 @@ pub async fn handshake(
         server_time: Utc::now(),
         seq: state.changes.last_seq(),
         max_body_bytes: state.config.max_body_bytes,
-        capabilities: vec![
-            "manifest",
-            "content",
-            "etag-conflict",
-            "move",
-            "mkdir",
-            "websocket",
-            "devices",
-            "binary",
-        ],
+        capabilities: SYNC_CAPABILITIES.to_vec(),
     }))
 }
 
@@ -242,6 +242,11 @@ pub struct SyncEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     pub content_type: String,
+    /// Which root type carries the content: `text` (`Y.Text`) or `value` (`Y.Map` register).
+    ///
+    /// A protocol 1 client must not open a live YDoc for a `value` file – it would read an empty
+    /// text root and could write that emptiness back (§6).
+    pub shape: String,
     pub version: i64,
     pub sync_mode: String,
     pub updated_at: chrono::DateTime<Utc>,
@@ -281,16 +286,18 @@ pub async fn manifest(
         if path.is_empty() {
             continue;
         }
+        let content_type = meta
+            .content_type
+            .clone()
+            .unwrap_or_else(|| meisync_core::guess_content_type(&meta.name));
         let entry = SyncEntry {
             path: path.clone(),
             name: meta.name.clone(),
             kind: meta.kind.as_str().to_string(),
             size: meta.size,
             etag: meta.etag.clone(),
-            content_type: meta
-                .content_type
-                .clone()
-                .unwrap_or_else(|| meisync_core::guess_content_type(&meta.name)),
+            content_type: content_type.clone(),
+            shape: meisync_core::content_shape(&content_type).as_str().to_string(),
             version: meta.version,
             sync_mode: meta.sync_mode.as_str().to_string(),
             updated_at: meta.updated_at,

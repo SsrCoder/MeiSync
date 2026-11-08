@@ -453,3 +453,271 @@ async fn deleting_a_document_removes_every_artefact() {
     assert_eq!(f.manager.cached_len().await, 0);
     assert!(f.manager.peek(&f.meta.id).await.is_none());
 }
+// -------------------------------------------------------------------------------------------
+// Whole-value documents (`docs/structured-json-docs.md`)
+// -------------------------------------------------------------------------------------------
+
+fn apply_into(doc: &yrs::Doc, bytes: &[u8]) {
+    let mut txn = doc.transact_mut();
+    txn.apply_update(Update::decode_v1(bytes).expect("update"))
+        .expect("apply");
+}
+
+/// A document whose content type asks for the `Value` shape.
+async fn fixture_json() -> Fixture {
+    let mut fixture = fixture().await;
+    let meta = FileMetadata {
+        name: "recommendations.json".into(),
+        content_type: Some("application/json".into()),
+        ..fixture.meta.clone()
+    };
+    fixture.meta = FileRepository::new(fixture.db.clone())
+        .update_meta(&meta)
+        .await
+        .map(|()| meta)
+        .expect("update meta");
+    fixture
+}
+
+#[tokio::test]
+async fn a_json_document_round_trips_through_the_value_register() {
+    let f = fixture_json().await;
+    let user = UserId::new("alice");
+    let handle = f.manager.open(&f.meta).await.expect("open");
+
+    let body = r#"{"generated_at_ms":1,"items":[1,2,3]}"#;
+    let snapshot = handle
+        .replace_content(&user, body.as_bytes().to_vec(), None)
+        .await
+        .expect("write");
+    assert_eq!(snapshot.size, body.len() as u64);
+    assert_eq!(handle.read().await.content, body.as_bytes());
+
+    // The bytes live in the register; the text root was never touched.
+    let doc = handle.raw_doc().await;
+    assert_eq!(meisync_core::read_value(&doc).as_deref(), Some(body));
+    assert_eq!(
+        meisync_core::read_text(&doc),
+        "",
+        "a value document must not carry characters"
+    );
+
+    // A second write replaces the register instead of appending to it.
+    handle
+        .replace_content(&user, br#"{"generated_at_ms":2}"#.to_vec(), None)
+        .await
+        .expect("rewrite");
+    assert_eq!(handle.read().await.content, br#"{"generated_at_ms":2}"#);
+}
+
+#[tokio::test]
+async fn concurrent_value_writes_keep_exactly_one_value() {
+    let f = fixture_json().await;
+    let user = UserId::new("alice");
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    let (_conn, mut events) = f.manager.subscribe(&f.meta.id).await;
+
+    handle
+        .replace_content(&user, br#"{"v":0}"#.to_vec(), None)
+        .await
+        .expect("baseline");
+    let base = handle.full_state().await;
+    let _ = events.recv().await;
+
+    // A peer that shares the document state writes without seeing our next write.
+    let peer = yrs::Doc::new();
+    apply_into(&peer, &base);
+    let peer_update = meisync_core::replace_content(
+        &peer,
+        &meisync_core::TransactionOrigin::system("peer"),
+        meisync_core::ContentShape::Value,
+        r#"{"v":"peer"}"#,
+    );
+
+    let ours = handle
+        .replace_content(&user, br#"{"v":"server"}"#.to_vec(), None)
+        .await
+        .expect("write");
+    assert_eq!(ours.size, br#"{"v":"server"}"#.len() as u64);
+    let our_update = match events.recv().await.expect("event") {
+        RoomEvent::Update(bytes) => bytes,
+        other => panic!("unexpected event: {other:?}"),
+    };
+
+    // Merge in both directions: the peer's write lands afterwards, without having seen ours.
+    apply_into(&peer, &our_update);
+    handle
+        .apply_update(&user, peer_update, None)
+        .await
+        .expect("apply peer update");
+
+    let winner = handle.read().await.content;
+    let peer_value =
+        meisync_core::document_content(&peer, meisync_core::ContentShape::Value).into_bytes();
+    assert!(
+        winner == br#"{"v":"server"}"#.to_vec() || winner == br#"{"v":"peer"}"#.to_vec(),
+        "one of the two values must win, got {:?}",
+        String::from_utf8_lossy(&winner)
+    );
+    assert_eq!(
+        winner, peer_value,
+        "both peers must converge on the same value"
+    );
+}
+
+#[tokio::test]
+async fn sequential_value_writes_keep_the_last_one() {
+    let f = fixture_json().await;
+    let user = UserId::new("alice");
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    let (_conn, mut events) = f.manager.subscribe(&f.meta.id).await;
+
+    handle
+        .replace_content(&user, br#"{"v":"first"}"#.to_vec(), None)
+        .await
+        .expect("first");
+    let first_update = match events.recv().await.expect("event") {
+        RoomEvent::Update(bytes) => bytes,
+        other => panic!("unexpected event: {other:?}"),
+    };
+
+    // The peer sees the first write, then writes on top of it: causal order, no clock involved.
+    let peer = yrs::Doc::new();
+    apply_into(&peer, &first_update);
+    let peer_update = meisync_core::replace_content(
+        &peer,
+        &meisync_core::TransactionOrigin::system("peer"),
+        meisync_core::ContentShape::Value,
+        r#"{"v":"second"}"#,
+    );
+    handle
+        .apply_update(&user, peer_update.clone(), None)
+        .await
+        .expect("apply");
+
+    assert_eq!(handle.read().await.content, br#"{"v":"second"}"#);
+    apply_into(&peer, &first_update);
+    assert_eq!(
+        meisync_core::document_content(&peer, meisync_core::ContentShape::Value),
+        r#"{"v":"second"}"#
+    );
+}
+
+#[tokio::test]
+async fn restart_keeps_size_and_etag_of_a_value_document() {
+    let f = fixture_json().await;
+    let user = UserId::new("alice");
+    let body = br#"{"items":[{"id":"a"},{"id":"b"}]}"#;
+    let (etag, size) = {
+        let handle = f.manager.open(&f.meta).await.expect("open");
+        let snapshot = handle
+            .replace_content(&user, body.to_vec(), None)
+            .await
+            .expect("write");
+        (snapshot.etag, snapshot.size)
+    };
+    assert_eq!(size, body.len() as u64);
+
+    // Rebuild the document from snapshot + update log with a brand new manager (§17, §18).
+    let files = Arc::new(FileRepository::new(f.db.clone()));
+    let ydocs = Arc::new(YDocRepository::new(f.db.clone()));
+    let restarted = DocumentManager::new(
+        f.store.clone(),
+        files,
+        ydocs,
+        DocumentManagerConfig::default(),
+    );
+    let handle = restarted.open(&f.meta).await.expect("reopen");
+    let snapshot = handle.read().await;
+    assert_eq!(snapshot.content, body.to_vec(), "content survives the restart");
+    assert_eq!(snapshot.size, size, "the size cache must not collapse to 0");
+    assert_eq!(snapshot.etag, etag, "the etag must survive the restart");
+}
+
+#[tokio::test]
+async fn lazy_migration_copies_a_legacy_text_document_into_the_register() {
+    let f = fixture_json().await;
+    let legacy = r#"{"legacy":true}"#;
+
+    // A document written before the value shape existed: bytes only in Y.Text.
+    let doc = yrs::Doc::new();
+    let update = meisync_core::replace_content(
+        &doc,
+        &meisync_core::TransactionOrigin::system("legacy"),
+        meisync_core::ContentShape::Text,
+        legacy,
+    );
+    let seq = f
+        .store
+        .append_update(&f.meta.id, &update)
+        .await
+        .expect("append");
+    YDocRepository::new(f.db.clone())
+        .record_update(&f.meta.id, seq)
+        .await
+        .expect("record");
+
+    // First open migrates lazily (§7).
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    assert_eq!(handle.read().await.content, legacy.as_bytes());
+    let doc = handle.raw_doc().await;
+    assert_eq!(meisync_core::read_value(&doc).as_deref(), Some(legacy));
+    assert_eq!(
+        meisync_core::read_text(&doc),
+        legacy,
+        "the legacy content root is kept as it was"
+    );
+
+    // The migration is persisted: a fresh load reads the register, not the text.
+    let files = Arc::new(FileRepository::new(f.db.clone()));
+    let ydocs = Arc::new(YDocRepository::new(f.db.clone()));
+    let restarted = DocumentManager::new(
+        f.store.clone(),
+        files,
+        ydocs,
+        DocumentManagerConfig::default(),
+    );
+    let handle = restarted.open(&f.meta).await.expect("reopen");
+    assert_eq!(handle.read().await.content, legacy.as_bytes());
+    let doc = handle.raw_doc().await;
+    assert_eq!(meisync_core::read_value(&doc).as_deref(), Some(legacy));
+}
+
+/// The migration changes the document state, so the cached metadata must follow it: a manifest
+/// ETag (SQLite) that disagrees with the GET ETag (in-memory YDoc) of the same file is a §26 bug.
+#[tokio::test]
+async fn lazy_migration_refreshes_the_cached_metadata() {
+    let f = fixture_json().await;
+    let legacy = r#"{"legacy":true}"#;
+    let doc = yrs::Doc::new();
+    let update = meisync_core::replace_content(
+        &doc,
+        &meisync_core::TransactionOrigin::system("legacy"),
+        meisync_core::ContentShape::Text,
+        legacy,
+    );
+    let seq = f
+        .store
+        .append_update(&f.meta.id, &update)
+        .await
+        .expect("append");
+    YDocRepository::new(f.db.clone())
+        .record_update(&f.meta.id, seq)
+        .await
+        .expect("record");
+
+    let handle = f.manager.open(&f.meta).await.expect("open");
+    let snapshot = handle.read().await;
+    let meta = FileRepository::new(f.db.clone())
+        .find_by_id(&f.meta.id)
+        .await
+        .expect("find")
+        .expect("row");
+    assert_eq!(meta.size, snapshot.size, "the cached size must follow the migration");
+    assert_eq!(
+        meta.etag.as_deref(),
+        Some(snapshot.etag.as_str()),
+        "the cached etag must follow the migration"
+    );
+    assert_eq!(meta.version, snapshot.version, "and so must the revision");
+}

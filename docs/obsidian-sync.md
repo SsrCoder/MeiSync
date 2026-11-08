@@ -104,6 +104,10 @@ Limitations of the current Editor-API bridge:
 * The YSync provider is verified against a live node: two independent clients converge
   character-by-character on concurrent edits, and `GET /api/sync/file` materialises exactly the
   converged `Y.Text("content")`.
+* Whole-value files (`application/json`, manifest `shape: "value"`) are carried by a `Y.Map`
+  register instead of `Y.Text` (`docs/structured-json-docs.md`). The provider here speaks sync
+  protocol 1 and does not pass `?protocol=2`, so the node refuses it the live document for those
+  files and the plugin syncs them through the HTTP file API – correct, just not realtime.
 * The planner, path/exclusion rules and text diff are unit-tested (`npm test`, 28 tests).
 * The Obsidian `Editor` bridge (transaction-based apply, cursor mapping, autosave flush) compiles
   and is guarded defensively, but it has not yet been exercised in a real Obsidian GUI. Treat the
@@ -118,7 +122,7 @@ A file-level sync round is:
    register/update the device. **Test connection does not call this endpoint**, so it never
    provisions a folder for a half-typed remote path.
 2. `GET /api/sync/manifest` – recursive list of relative paths with `etag`, `version`, `size`,
-   `kind` and `content_type`.
+   `kind`, `content_type` and `shape` (`text` | `value`, protocol 2).
 3. Scan the local vault (`getAllLoadedFiles`) and apply include/exclude/attachment rules.
 4. Diff **baseline ↔ local ↔ remote** with a pure planner
    (`obsidian-plugin/src/sync/planner.ts`).

@@ -810,3 +810,79 @@ fn signing_key(secret: &[u8], date: &str, region: &str, service: &str) -> Vec<u8
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
 }
+
+// -------------------------------------------------------------------------------------------
+// Whole-value documents (`docs/structured-json-docs.md` §8, §10)
+// -------------------------------------------------------------------------------------------
+
+/// S3 GetObject of a `.json` file agrees with the WebDAV projection of the same document:
+/// same bytes, same `Content-Length`, same `ETag`.
+#[tokio::test]
+async fn s3_get_value_shape_json() {
+    let harness = Harness::spawn().await;
+    let token = harness.register("alice").await;
+    let body = r#"[{"id":"a","plays":3},{"id":"b","plays":1}]"#;
+
+    let response = harness
+        .send(harness.request_with_body(
+            "PUT",
+            "/s3/alice/library.json",
+            Some(&token),
+            Some("application/json"),
+            body,
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = harness
+        .send(harness.request("GET", "/s3/alice/library.json", Some(&token)))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        &body.len().to_string().as_str()
+    );
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_string();
+    assert_eq!(body_string(response).await, body);
+
+    // The WebDAV projection of the very same document reports identical bytes and ETag (§37).
+    let response = harness
+        .send(harness.request("GET", "/dav/private/alice/library.json", Some(&token)))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("etag").and_then(|v| v.to_str().ok()),
+        Some(etag.as_str())
+    );
+    assert_eq!(body_string(response).await, body);
+
+    // HeadObject and ListObjectsV2 report the same size.
+    let response = harness
+        .send(harness.request("HEAD", "/s3/alice/library.json", Some(&token)))
+        .await;
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        &body.len().to_string().as_str()
+    );
+    let response = harness
+        .send(harness.request("GET", "/s3/alice?list-type=2", Some(&token)))
+        .await;
+    let xml = body_string(response).await;
+    assert!(xml.contains("<Key>library.json</Key>"), "{xml}");
+    assert!(
+        xml.contains(&format!("<Size>{}</Size>", body.len())),
+        "{xml}"
+    );
+}
